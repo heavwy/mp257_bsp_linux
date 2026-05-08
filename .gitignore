@@ -169,3 +169,15 @@ sphinx_*/
 
 # Rust analyzer configuration
 /rust-project.json
+
+.stamp_*
+.files-list*
+.br_regen_dot_config
+.checked-atomic-*
+..checked-atomic-*
+.tmp_vmlinux*
+.version
+/compile_commands.json
+/.vscode/
+/.cache/
+
