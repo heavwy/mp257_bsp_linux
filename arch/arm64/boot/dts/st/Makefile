@@ -3,4 +3,7 @@ dtb-$(CONFIG_ARCH_STM32) += \
 	stm32mp215f-dk.dtb \
 	stm32mp235f-dk.dtb \
 	stm32mp257f-dk.dtb \
-	stm32mp257f-ev1.dtb
+	stm32mp257f-ev1.dtb \
+	stm32mp257d-atk.dtb \
+	stm32mp257d-atk-bsp.dtb
+
