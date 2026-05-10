@@ -22,10 +22,10 @@
 │  对一个子系统的完整分析 — 分 11 步                              │
 │    ├─ ⓪ 发展历史             ── 30 年演进，有趣有料             │
 │    ├─ ① 使用方法             ── 用户态/内核态/DTS              │
-│    ├─ ② 架构与数据结构        ── 分层图 + 结构体关联 + 状态机    │
-│    ├─ ③ Probe 源码分析       ── probe 逐行分析                  │
-│    ├─ ④ 数据/中断路径分析     ── 传输/中断/电源管理              │
-│    ├─ ⑤ 硬件手册关联         ── 寄存器 ↔ 代码对应              │
+│    ├─ ② 硬件详解（可选）      ── 总线协议 + SoC 控制器寄存器     │
+│    ├─ ③ 架构与数据结构        ── 分层图 + 结构体关联 + 状态机    │
+│    ├─ ④ Probe 源码分析       ── probe 逐行分析                  │
+│    ├─ ⑤ 数据/中断路径分析     ── 传输/中断/电源管理              │
 │    ├─ ⑥ 错误处理             ── EPROBE_DEFER + 回滚            │
 │    ├─ ⑦ 情景分析             ── 完整链路走通                   │
 │    ├─ ⑧ 面试现场             ── 核心问题深挖                   │
@@ -156,11 +156,68 @@
 
 ---
 
-### 步骤 ② 架构与数据结构分析
+### 步骤 ② 硬件详解（可选）
 
-产出文档: `02-Architecture.md`
+产出文档: `02-Hardware.md`
 
-**2.1 分层架构图**
+> 对于有复杂总线协议的子系统（MMC、USB、PCIe、SDIO 等），在深入架构之前需要先理解协议层。
+> 对于简单子系统（GPIO、CLK、PINCTRL 等），这一步可以跳过。
+
+**内容包括三部分：**
+
+**2.1 总线/协议层**（来自行业标准，非内核独有）
+
+- 命令类型与格式（Read/Write/Erase/IOCtrl…）
+- 响应类型与状态机
+- 传输模式演进：PIO → DMA → ADMA（为什么一代代演进）
+- 数据组织方式：扇区、块、描述符表
+
+**2.2 SoC 控制器寄存器概述**（来自硬件手册）
+
+以 STM32MP2 SDMMC2 为例：
+
+| 偏移 | 寄存器名 | 功能 | 源码引用 |
+|------|---------|------|---------|
+| 0x000 | SDMMC_POWER | 电源控制 | `writel(pwr, base + SDMMC_POWER)` |
+| 0x004 | SDMMC_CLKCR | 时钟分频 | `writel(clk, base + SDMMC_CLKCR)` |
+| 0x008 | SDMMC_ARG | 命令参数 | `writel(arg, base + SDMMC_ARG)` |
+| 0x00C | SDMMC_CMD | 命令发送 | 触发传输 |
+| 0x010 | SDMMC_RESPCMD | 响应命令号 | 读响应时检查 |
+| 0x014 | SDMMC_RESP0~3 | 响应数据 | `readl(base + SDMMC_RESP0)` |
+| 0x024 | SDMMC_DTIMER | 数据超时 | `writel(timeout, base + SDMMC_DTIMER)` |
+| 0x028 | SDMMC_DLEN | 数据长度 | `writel(len, base + SDMMC_DLEN)` |
+| 0x02C | SDMMC_DCTRL | 数据控制 | 配置方向/使能 |
+| 0x030 | SDMMC_DCNT | 数据计数 | 读剩余字节 |
+| 0x050 | SDMMC_IDMACTRL | IDMA 控制 | ADMA 使能 |
+| 0x058 | SDMMC_IDMABSIZE | IDMA 突发大小 | ADMA 配置 |
+| 0x100 | SDMMC_IDMA_DESCRIPTOR_N | 描述符表 | ADMA 链表 |
+
+> 这里的核心思路是：**先知道"硬件能做什么"（协议层）和"怎么控制它"（寄存器层），再看"内核是怎么封装这些的"（架构层）。** 不懂协议就看不懂代码，但也不需要背寄存器——知道存在哪里、遇到问题知道去哪查就可以了。
+
+**2.3 数据流硬件路径**（打通 2.1 和 2.2）
+
+```
+CPU (DDR)
+  │ DMA 描述符
+  ▼
+ADMA 控制器 (SDMMC_IDMACTRL)
+  │ 从 DDR 读取描述符表
+  ▼
+SDMMC 数据 FIFO
+  │ 按 SDMMC_DCTRL 配置传输
+  ▼
+DAT[7:0] 总线
+  │ MMC 协议封装（CRC/Start/End bits）
+  ▼
+eMMC 芯片内部
+
+---
+
+### 步骤 ③ 架构与数据结构分析
+
+产出文档: `03-Architecture.md`
+
+**3.1 分层架构图**
 
 按六层模型画出该子系统：
 
@@ -173,7 +230,7 @@ Layer 5: 寄存器操作   — ——readl/writel 访问
 Layer 6: 物理硬件     — ——外设基址，中断号
 ```
 
-**2.2 核心数据结构关联图**
+**3.2 核心数据结构关联图**
 
 列出 3-5 个核心结构体，画清楚:
 
@@ -198,7 +255,7 @@ struct hw_ops {
 
 对每个结构体解释**为什么需要它**（它解决了什么问题）。
 
-**2.3 状态机**
+**3.3 状态机**
 
 画出关键的状态迁移：
 
@@ -207,15 +264,15 @@ PROBE → READY → SUSPEND → RESUME → REMOVE
                 → TRANSFER (数据传输中状态)
 ```
 
-**2.4 设计模式**
+**3.4 设计模式**
 
 识别并说明该子系统的设计模式（分层分离、注册回调、container_of、生产者-消费者、缓存优化等）。
 
 ---
 
-### 步骤 ③ Probe 流程源码分析
+### 步骤 ④ Probe 流程源码分析
 
-产出文档: `03-Probe-Analysis.md`
+产出文档: `04-Probe-Analysis.md`
 
 **3.1 入口定位**
 
@@ -267,9 +324,9 @@ probe 后: state → READY, 已加入 core 链表, 设备节点已创建
 
 ---
 
-### 步骤 ④ 数据/中断路径分析
+### 步骤 ⑤ 数据/中断路径分析
 
-产出文档: `04-DataPath-Analysis.md`
+产出文档: `05-DataPath-Analysis.md`
 
 如果子系统涉及数据收发或中断处理，追踪以下路径：
 
@@ -302,22 +359,6 @@ probe 后: state → READY, 已加入 core 链表, 设备节点已创建
 xxx_suspend(): 保存寄存器上下文，关时钟，选 sleep pinctrl 状态
 xxx_resume(): 恢复寄存器，开时钟，恢复 default pinctrl 状态
 ```
-
----
-
-### 步骤 ⑤ 硬件手册关联
-
-产出文档: `05-Hardware-Registers.md`
-
-**寄存器速查表**
-
-| 偏移 | 寄存器名 | 功能 | 位域说明 | 代码引用 |
-|------|---------|------|---------|---------|
-| 0x00 | XXX_CR1 | 控制寄存器1 | [0]EN, [3:1]MODE, [4]IE | `writel(val, base + CR1)` |
-| 0x04 | XXX_SR | 状态寄存器 | [0]RXNE, [1]TXE | `readl(base + SR)` |
-| 0x08 | XXX_DR | 数据寄存器 | [7:0]数据 | `readl(base + DR)` |
-
-每行对应代码中具体的 `readl`/`writel` 调用和手册中的章节号。
 
 ---
 
@@ -553,10 +594,10 @@ note/<SubsystemName>/
 ├── README.md                     ← 系列索引
 ├── 00-History.md                 ← 30 年演进史
 ├── 01-Usage.md                   ← 使用方法 + DTS
-├── 02-Architecture.md            ← 分层架构 + 数据结构 + 状态机
-├── 03-Probe-Analysis.md          ← Probe 流程逐行分析
-├── 04-DataPath-Analysis.md       ← 数据/中断路径 (如适用)
-├── 05-Hardware-Registers.md      ← 硬件寄存器速查
+├── 02-Hardware.md                ← 硬件协议 + 控制器寄存器（可选）
+├── 03-Architecture.md            ← 分层架构 + 数据结构 + 状态机
+├── 04-Probe-Analysis.md          ← Probe 流程逐行分析
+├── 05-DataPath-Analysis.md       ← 数据/中断路径 (如适用)
 ├── 06-Error-Handling.md          ← 错误处理 + 健壮性
 ├── 07-Scenario-Analysis.md       ← 情景分析
 ├── 08-Interview.md               ← 面试现场
@@ -577,7 +618,7 @@ note/<SubsystemName>/
 |---|------|------|------|
 | 1 | [01-Usage.md](01-Usage.md) | 用户态接口、内核API、DTS配置 | ✅ |
 | 2 | [02-Architecture.md](02-Architecture.md) | 六层架构、核心结构、状态机 | ✅ |
-| 3 | [03-Probe-Analysis.md](03-Probe-Analysis.md) | Probe 逐行分析 | ⏳ |
+| 3 | [04-Probe-Analysis.md](04-Probe-Analysis.md) | Probe 逐行分析 | ⏳ |
 | ... | ... | ... | ... |
 
 ## 学习路线
@@ -611,22 +652,22 @@ note/<SubsystemName>/
 
 各子系统在学习时可以调整上述 8 步的侧重：
 
-| 子系统 | Usage | 架构/数据结构 | Probe | 数据路径 | 中断 | 寄存器 | 错误处理 | 情景 | 面试 |
-|--------|-------|-------------|-------|---------|------|-------|---------|------|------|
-| **GPIO** | libgpiod | gpio_chip/desc | 简单 | 无 | 可选 | 简单 | 简单 | 按键→输入 | 3题 |
-| **PINCTRL** | debugfs | pinctrl_dev | 简单 | 配置 | 无 | 中 | 简单 | 引脚复用 | 3题 |
-| **CLK** | debugfs | clk_hw/core | 中 | 无 | 无 | 中 | 中 | — | 2题 |
-| **I2C** | i2c-tools | adapter/client | 简单 | ✦✦✦✦ | 可选 | 简单 | 简单 | 读写 EEPROM | 4题 |
-| **SPI** | spidev | controller/device | 简单 | ✦✦✦✦ | 可选 | 简单 | 简单 | DMA 传输 | 4题 |
-| **UART** | stty/minicom | uart_port/kfifo | 简单 | ✦✦✦✦ | ✦✦✦✦ | 简单 | 中 | 串口收发 | 4题 |
-| **DMA** | — | dma_chan/sg | 中 | ✦✦✦✦ | ✦✦✦✦ | 复杂 | 中 | 内存拷贝 | 5题 |
-| **INPUT** | evtest | input_dev/handler | 低 | ✦✦✦ | ✦✦✦✦ | 无 | 中 | 按键上报 | 4题 |
-| **ETH** | ifconfig | net_device/skb | 复杂 | ✦✦✦✦✦ | ✦✦✦✦✦ | 复杂 | 复杂 | 收发包 | 6题 |
-| **AUDIO** | aplay/arecord | snd_soc_card | 复杂 | DMA循环 | 周期性 | 复杂 | 复杂 | 播放/录音 | 6题 |
-| **DISPLAY** | modetest | drm_device/fb | 复杂 | vblank | vsync | 复杂 | 复杂 | 刷新屏幕 | 7题 |
-| **MMC** | mount/dd | mmc_host/block | 复杂 | ✦✦✦✦ | 复杂 | 复杂 | 中 | 读写 SD | 5题 |
-| **USB** | lsusb | usb_host/urb | 复杂 | ✦✦✦✦✦ | ✦✦✦✦ | 复杂 | 复杂 | 枚举/传输 | 6题 |
-| **PCIe** | lspci | pci_bus/dev | 复杂 | BAR/DMA | MSI | 复杂 | 复杂 | 配置空间 | 5题 |
+| 子系统 | Usage | 硬件(可选) | 架构/数据结构 | Probe | 数据路径 | 错误处理 | 情景 | 面试 |
+|--------|-------|-----------|-------------|-------|---------|---------|------|------|
+| **GPIO** | libgpiod | — | gpio_chip/desc | 简单 | 无 | 简单 | 按键→输入 | 3题 |
+| **PINCTRL** | debugfs | — | pinctrl_dev | 简单 | 配置 | 中 | 引脚复用 | 3题 |
+| **CLK** | debugfs | — | clk_hw/core | 中 | 无 | 中 | — | 2题 |
+| **I2C** | i2c-tools | I2C总线协议 | adapter/client | 简单 | ✦✦✦✦ | 简单 | 读写 EEPROM | 4题 |
+| **SPI** | spidev | SPI总线协议 | controller/device | 简单 | ✦✦✦✦ | 简单 | DMA 传输 | 4题 |
+| **UART** | stty/minicom | 串口协议 | uart_port/kfifo | 简单 | ✦✦✦✦ | 简单 | 串口收发 | 4题 |
+| **DMA** | — | DMA控制器 | dma_chan/sg | 中 | ✦✦✦✦ | 中 | 内存拷贝 | 5题 |
+| **INPUT** | evtest | — | input_dev/handler | 低 | ✦✦✦ | 中 | 按键上报 | 4题 |
+| **ETH** | ifconfig | MAC/PHY层 | net_device/skb | 复杂 | ✦✦✦✦✦ | 复杂 | 收发包 | 6题 |
+| **AUDIO** | aplay/arecord | I2S/PCM协议 | snd_soc_card | 复杂 | ✦✦✦✦ | 复杂 | 播放/录音 | 6题 |
+| **DISPLAY** | modetest | 显示接口(MIPI/LVDS) | drm_device/fb | 复杂 | ✦✦✦✦ | 复杂 | 刷新屏幕 | 7题 |
+| **MMC** | mount/dd | **MMC协议/SDMA/ADMA** | mmc_host/block | 复杂 | ✦✦✦✦ | 中 | 读写eMMC | 5题 |
+| **USB** | lsusb | USB协议(xHCI) | usb_host/urb | 复杂 | ✦✦✦✦✦ | 复杂 | 枚举/传输 | 6题 |
+| **PCIe** | lspci | PCIe总线协议 | pci_bus/dev | 复杂 | BAR/DMA | 复杂 | 配置空间 | 5题 |
 
 ---
 
