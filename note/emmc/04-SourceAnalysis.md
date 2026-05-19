@@ -6,7 +6,7 @@
 > **前置:** [03-Architecture.md](03-Architecture.md) — 熟悉 mmc_host / mmc_card / ops 概念
 > **下一篇:** [05-IO-Path.md](05-IO-Path.md)
 >
-> **字数：** 中文字数 19,963 + 英文单词 12,706 ≈ **32,669 字**（含代码段），阅读时间约 **100-130 分钟**
+> **字数：** 中文字数 27,925 + 英文单词 10,016 ≈ **37,941 字**（含代码段），阅读时间约 **120-150 分钟**
 
 ---
 
@@ -2176,7 +2176,7 @@ static int mmc_init_card(struct mmc_host *host, u32 ocr,
     /* ⑥ CMD6 多次 SWITCH（时序/宽度/缓存/CMDQ） */
     err = mmc_select_timing(card);         // 时序协商阶梯
     mmc_select_bus_width(card);           // 总线宽度
-    mmc_switch(card, ..., CACHE_CTRL, 1); // 使能缓存
+    mmc_switch(card, ..., EXT_CSD_CACHE_CTRL, 1); // 使能缓存
     mmc_cmdq_enable(card);                // 使能 CMDQ
 }
 ```
@@ -2784,7 +2784,7 @@ ADTC 是协议中对"带数据传输命令"的分类。CMD8（EXT_CSD 读取）�
 | `raw_boot_mult` | 226 | Boot 分区大小（×128KB），ATK 板 4MB |
 | `rpmb_size_mult` | 168 | RPMB 分区大小（×128KB），ATK 板 4MB |
 | `raw_partition_support` | 160 | 分区支持能力（boot/ RPMB/ GP 分区） |
-| `cache_size` | 249(2B) 或 253(4B) | 缓存大小（byte），为后续缓存使能提供依据 |
+| `cache_size` | 249(2B) 或 249-252(4B) | 缓存大小（byte），为后续缓存使能提供依据 |
 | `cmdq_support` | 308 | CMDQ 队列深度掩码，决定是否使能命令队列 |
 | `generic_cmd6_time` | 148 | CMD6 SWITCH 操作超时（10ms 单位），内核用它设置 CMD6 等待时间 |
 | `strobe_support` | 184 | HS400 增强选通（Enhanced Strobe）支持 |
@@ -3314,6 +3314,75 @@ if ((caps2 & MMC_CAP2_HS400_ES) &&              // 主机支持
 | **缓存使能** | [33] CACHE_CTRL | 启用内部写缓存 |
 | **CMDQ 使能** | 通过 `mmc_cmdq_enable()` | 启用命令队列 |
 
+#### 4.4.5.8 CMD6 使能缓存（Cache Enable）
+
+> **状态机上下文：** Transfer State，CMD6 修改 EXT_CSD 寄存器，不改变卡状态。
+
+时序协商和总线宽度完成后，`mmc_init_card()` 的最后一步是使能 eMMC 内部写缓存：
+
+```c
+/* mmc.c:1861-1887 */
+/*
+ * If cache size is higher than 0, this indicates the existence of cache
+ * and it can be turned on. Note that some eMMCs from Micron has been
+ * reported to need ~800 ms timeout, while enabling the cache after
+ * sudden power failure tests. Let's extend the timeout to a minimum of
+ * DEFAULT_CACHE_EN_TIMEOUT_MS and do it for all cards.
+ */
+if (card->ext_csd.cache_size > 0) {
+    unsigned int timeout_ms = MIN_CACHE_EN_TIMEOUT_MS;   // = 1600ms
+
+    timeout_ms = max(card->ext_csd.generic_cmd6_time, timeout_ms);
+    err = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
+                     EXT_CSD_CACHE_CTRL, 1, timeout_ms);
+    if (err && err != -EBADMSG)
+        goto free_card;
+
+    if (err) {
+        /* -EBADMSG: 卡声明有缓存但实际不支持 */
+        pr_warn("%s: Cache is supported, but failed to turn on (%d)\n",
+                mmc_hostname(card->host), err);
+        card->ext_csd.cache_ctrl = 0;
+    } else {
+        card->ext_csd.cache_ctrl = 1;
+    }
+}
+```
+
+逐行解读：
+
+**① `card->ext_csd.cache_size > 0` — 卡是否有缓存？**
+
+`cache_size` 来自 EXT_CSD[249:252]（rev >= 6 取 4 字节，否则取 [249:250] 2 字节），单位是字节。如果为 0，说明卡内部没有写缓存硬件，整个流程跳过。
+
+**② `MIN_CACHE_EN_TIMEOUT_MS = 1600ms` — 超时陷阱**
+
+注释说明背景：**Micron 某些 eMMC 在断电测试后需要约 800ms 才能完成缓存使能**。内核保守地把所有卡的缓存使能超时设为至少 1600ms，再和 `generic_cmd6_time`（EXT_CSD[148]，通常 ~10ms）取最大值。对比普通 CMD6 时序切换的超时通常仅 ~10ms，此处长了两个数量级。
+
+**③ `EXT_CSD_CACHE_CTRL` — 字节 33**
+
+写 1 使能缓存，写 0 禁用缓存（R/W）。与 FLUSH（字节 32，WO）是两个独立寄存器——CACHE_CTRL 控制开关，FLUSH_CACHE 写任意值触发刷写。
+
+**④ 错误处理**
+
+| 返回值 | 含义 | 处理 |
+|--------|------|------|
+| `0` | 成功 | `cache_ctrl = 1` |
+| `-EBADMSG` | 卡 SWITCH_ERROR | 卡声称有缓存但实际不支持，仅警告不阻断 |
+| 其他错误 | CMD6 传输异常 | `goto free_card`，初始化失败 |
+
+**⑤ `cache_ctrl` 标志的后续用途**
+
+`card->ext_csd.cache_ctrl = 1` 在后续多处被检查：
+- `_mmc_cache_enabled()`：`return cache_size > 0 && cache_ctrl & 1`
+- `mmc_blk_alloc_req()` 第⑤步：通过 `mmc_cache_enabled()` 设置 `QUEUE_FLAG_WC`
+- `_mmc_flush_cache()`：只在 `cache_enabled` 为真时发 FLUSH
+- `Suspend` 路径：休眠前刷缓存，唤醒后重新使能
+
+**⑥ 与块层的关系**
+
+卡初始化中 CMD6 写字节 33=1 完成**硬件使能**；后续 `mmc_blk_probe()` 在块层通过 `blk_queue_write_cache()` 设置 `QUEUE_FLAG_WC`，告诉文件系统"该设备支持写缓存"。两个层面独立——硬件使能 + 软件通告，详见 4.5.4 节第⑤步。
+
 ### 4.4.6 Tuning — DLYB 延迟线校准
 
 **状态机上下文：** Tuning 在 **Transfer State** 中执行。CMD21（SEND_TUNING_BLOCK）是数据传输命令，卡在 Transfer State 内接收调谐块并返回——每发一次 CMD21 卡短暂进入 **Data State** 传输数据，传完回到 **Transfer State**。状态迁移模式：`Transfer ↔ Data`。
@@ -3490,7 +3559,7 @@ DDR52 的工作频率是 52MHz，信号周期 ~19.2ns。MB 级 PCB 走线延迟�
 
 > **核心问题：** 阶段三结束时 eMMC 卡已经跑在 DDR52 模式、CMD 序列全部完成、`mmc_card` 结构体填充了完整的 EXT_CSD 信息。但此时还没有 `/dev/mmcblk1`——块设备节点的创建是阶段四的任务。
 >
-> 阶段四的输入是 `mmc_card`（卡设备），输出是 4 个块设备节点（`mmcblk1`、`mmcblk1boot0`、`mmcblk1boot1`、`mmcblk1rpmb`）。背后的操作是：**MMC 总线匹配 → mmc_block 驱动 probe → gendisk 分配与注册**。
+> 阶段四的输入是 `mmc_card`（卡设备），输出是 3 个块设备节点 + 1 个字符设备节点（`mmcblk1`、`mmcblk1boot0`、`mmcblk1boot1`、`mmcblk1rpmb`——其中 RPMB 是字符设备）。背后的操作是：**MMC 总线匹配 → mmc_block 驱动 probe → gendisk 分配与注册 + RPMB 字符设备创建**。
 
 ### 4.5.1 从 mmc_card 到块设备 — 总览
 
@@ -3523,7 +3592,7 @@ CMD 序列完成后 `mmc_attach_mmc()` 的最后一步：
 mmc_add_card(host->card);
 ```
 
-`mmc_add_card()`（`bus.c:559`）初始化 `mmc_card.dev` 并注册到设备模型：
+`mmc_add_card()`（`bus.c:300`）初始化 `mmc_card.dev` 并注册到设备模型：
 
 ```c
 int mmc_add_card(struct mmc_card *card)
@@ -3532,15 +3601,17 @@ int mmc_add_card(struct mmc_card *card)
 
     /* parent = MMC host class device (/sys/class/mmc_host/mmc1/) */
     card->dev.parent = &card->host->class_dev;
+    card->dev.release = mmc_release_card;
 
     /* bus = mmc_bus_type — 挂到 MMC 总线上 */
     card->dev.bus = &mmc_bus_type;
 
-    /* 设备名 = "mmc1:0001"（控制器号:卡地址） */
-    dev_set_name(&card->dev, "mmc%d:%04x", card->host->index, card->rca);
+    /* 设备名 = "mmc1:0001"（host名:卡地址） */
+    dev_set_name(&card->dev, "%s:%04x",
+                 mmc_hostname(card->host), card->rca);
 
     /* 注册到 Linux 设备模型 — 触发总线匹配 */
-    device_add(&card->dev);
+    ret = device_add(&card->dev);
 }
 ```
 
@@ -3554,31 +3625,202 @@ device_add(card->dev)
   └─ bus_probe_device                       ← 触发匹配 probe
         └─ device_initial_probe
               └─ __device_attach
-                    ├─ mmc_bus_match(card->dev, mmc_drv)    ← 遍历总线上的驱动
-                    │     └─ 比较 card->dev 与 mmc_drv->id_table
-                    │        → mmc_block 的 id_table 匹配任意 MMC 卡
-                    │        → match 成功
-                    └─ mmc_blk_probe(card)                  ← 驱动 probe
+                    └─ bus_for_each_drv(mmc_bus_type, ...)  ← 遍历所有注册的驱动
+                         └─ __device_attach_driver(drv, dev)
+                              ├─ driver_match_device(drv, dev)
+                              ├─ driver_probe_device(drv, dev)
+                              │    └─ __driver_probe_device
+                              │         └─ really_probe → drv->probe(card)
+                              └─ 返回值决定是继续循环还是中断
 ```
 
-**匹配的依据是什么？** MMC 总线没有 vendor/device ID 表。`mmc_bus_match()`（`bus.c:297`）的逻辑很简单：
+#### 关键一：`mmc_bus_type` 没有 `.match` 回调
+
+`mmc_bus_type` 的定义（`bus.c:219`）：
 
 ```c
-/* 对于 MMC 卡设备 */
-static int mmc_bus_match(struct device *dev, struct device_driver *drv)
-{
-    /* mmc_card 设备 vs mmc_driver: 用 id_table 匹配 */
-    struct mmc_card *card = dev_to_mmc_card(dev);
-    struct mmc_driver *mmc_drv = drv_to_mmc_driver(drv);
+static struct bus_type mmc_bus_type = {
+    .name       = "mmc",
+    .dev_groups = mmc_dev_groups,
+    .uevent     = mmc_bus_uevent,
+    .probe      = mmc_bus_probe,    // 直接调用 drv->probe(card)
+    .remove     = mmc_bus_remove,
+    .shutdown   = mmc_bus_shutdown,
+    .pm         = &mmc_bus_pm_ops,
+    /* ⚠️ 没有 .match 成员！ */
+};
+```
 
-    return mmc_drv->id_table &&               // 驱动必须提供 id_table
-           mmc_match_card(mmc_drv->id_table, card);  // 匹配卡的类型等
+没有 `.match` 时，`driver_match_device()` 的默认行为（`base.h:164`）：
+
+```c
+static inline int driver_match_device(struct device_driver *drv,
+                                      struct device *dev)
+{
+    return drv->bus->match ? drv->bus->match(dev, drv) : 1;
+    //                        ↑ 没有 match → 默认返回 1（匹配）
 }
 ```
 
-而 `mmc_block` 的 id_table 定义（`block.c:3132-3133`）匹配所有 MMC 类型的卡，所以一旦 `mmc_card` 注册到总线，`mmc_block` 必然匹配。
+**所有注册到 `mmc_bus_type` 上的驱动都会收到"匹配成功"**，批量的 probe 尝试即将开始。
 
-### 4.5.3 `mmc_blk_probe()` — 四步完成块设备注册
+#### 关键二：`mmc_driver` 结构体也没有 id_table
+
+`mmc_driver`（`bus.h:33`）：
+
+```c
+struct mmc_driver {
+    struct device_driver drv;
+    int (*probe)(struct mmc_card *card);
+    void (*remove)(struct mmc_card *card);
+    void (*shutdown)(struct mmc_card *card);
+    /* ⚠️ 没有 id_table */
+};
+```
+
+MMC 总线既不靠 vendor/device ID，也不靠 id_table 匹配。**匹配条件是"全部放行"，过滤由 probe 函数自己决定。**
+
+#### 关键三：内核的 probe 批处理逻辑
+
+`__device_attach_driver()` 是每个驱动被调用时的回调（`dd.c:922-962`）：
+
+```c
+static int __device_attach_driver(struct device_driver *drv, void *_data)
+{
+    struct device_attach_data *data = _data;
+    struct device *dev = data->dev;
+    int ret;
+
+    /* ① 匹配阶段 */
+    ret = driver_match_device(drv, dev);
+    if (ret == 0) return 0;              // 不匹配 → 跳过，继续下一个
+    if (ret == -EPROBE_DEFER) return ret; // 延迟 → 中断循环
+    if (ret < 0) return ret;             // 错误 → 中断循环
+    /* ret > 0: 匹配成功 */
+
+    /* ② probe 阶段 — 注意注释！ */
+    /*
+     * Ignore errors returned by ->probe so that the next driver can try
+     * its luck.
+     */
+    ret = driver_probe_device(drv, dev);
+    if (ret < 0)
+        return ret;        // -EBUSY/-EPROBE_DEFER → 中断循环
+    return ret == 0;       // ★ 0(成功)→1中断, 正值(失败)→0继续
+}
+```
+
+`driver_probe_device()` 内部调用 `__driver_probe_device()`（`dd.c:780-800`）：
+
+```c
+static int __driver_probe_device(struct device_driver *drv, struct device *dev)
+{
+    if (dev->p->dead || !device_is_registered(dev))
+        return -ENODEV;
+
+    if (dev->driver)        // ← 关键门卫：该设备已经有驱动了？
+        return -EBUSY;      //   有 → 拒绝
+
+    /* 首次 probe */
+    ret = really_probe(dev, drv);
+    ...
+}
+```
+
+`really_probe()`（`dd.c:604`）是最终执行 probe 的地方：
+
+```
+really_probe(dev, drv)
+  ├─ dev->driver = drv;                    ← 先把驱动临时挂上 (dd.c:633)
+  ├─ call_driver_probe(dev, drv)           ← 调 bus.probe() → drv->probe(card)
+  │    └─ mmc_blk_probe(card)
+  │         ├─ 检查 CCC_BLOCK_READ         ← 自身过滤
+  │         ├─ 分配资源、创建设备
+  │         └─ return 0;                   ← 成功
+  │
+  ├─ [成功路径]                            ← probe 返回 0
+  │    └─ driver_bound(dev)                ← dev->driver 正式生效
+  │    └─ return 0
+  │
+  └─ [失败] probe 返回 -ENODEV 等
+       ├─ ret = -ret;                      ← 转为正值 (dd.c:674)
+       ├─ device_unbind_cleanup(dev)
+            └─ dev->driver = NULL;         ← 清除驱动标记 (dd.c:554)
+       └─ return 正值
+```
+
+#### 完整的遍历决策逻辑
+
+把返回值链拼起来（注意 `return ret == 0` 的布尔语义）：
+
+```
+                           │ driver_probe_device  │ __device_attach_driver  │ bus_for_each_drv
+                           │ 返回值               │ return ret == 0         │ if (error) break;
+───────────────────────────┼──────────────────────┼─────────────────────────┼─────────────────
+probe 成功 (返回 0)        │ 0                    │ 0==0 → true → 1        │ break！✓ 中断
+probe 失败 (如 -ENODEV)    │ 正数(19)             │ 19==0 → false → 0      │ continue 🠷
+dev->driver 已被占 (-EBUSY)│ -EBUSY               │ ret<0 → return -EBUSY   │ break！中断
+```
+
+**三个分支的正确理解：**
+
+| 场景 | `driver_probe_device` 返回 | `__device_attach_driver` 返回 | `bus_for_each_drv` | 说明 |
+|------|---------------------------|-------------------------------|--------------------|------|
+| ✅ probe 成功 | `0` | `return 0==0` → **1** | **中断** | **本驱动绑定成功，不再尝试后续驱动** |
+| ❌ probe 失败（如 -ENODEV） | 正数（`really_probe` 转换后） | `return 正数==0` → **0** | **继续** | 忽略错误，给下一个驱动机会 |
+| 🚫 dev->driver 已占用 | `-EBUSY` | `return -EBUSY` → **负值** | **中断** | 安全门卫，防止二次绑定 |
+
+**总结：如果某个驱动 probe 成功，循环立即停止。只有 probe 失败的驱动才会被跳过（继续循环）。**
+
+但这是否意味着"先注册的驱动一定赢"？不完全。详见下面的分析。
+
+#### ATK 板实际情况：只存在一个驱动
+
+检查 ATK BSP 内核的 `.config`：
+
+```
+CONFIG_MMC_BLOCK=y
+# CONFIG_MMC_TEST is not set    ← mmc_test 未编译
+```
+
+**MMC 总线上只注册了 `mmc_block` 一个驱动。没有竞争、没有顺序依赖。** `mmc_add_card` → `device_add` → `bus_for_each_drv` 遍历的唯一驱动就是 `mmc_block`，匹配 → probe → 绑定，完成。
+
+#### 拓展：如果存在多个 MMC 驱动呢？
+
+MMC 子系统中除了 `mmc_block`，还有 `mmc_test` 驱动（调试用，`CONFIG_MMC_TEST` 开启时编译）。两者都用 `module_init()` 注册到 `mmc_bus_type`。
+
+在 Makefile（`drivers/mmc/core/Makefile`）中：
+
+```makefile
+obj-$(CONFIG_MMC_BLOCK)  += mmc_block.o    # block.o + queue.o
+obj-$(CONFIG_MMC_TEST)   += mmc_test.o     # 调试驱动
+```
+
+`mmc_block.o` 链接在前，因此 `mmc_blk_init` 的 `module_init` 先于 `mmc_test_init` 执行，`mmc_block` 驱动先被注册到总线。
+
+但 `mmc_test` 是否可能抢在 `mmc_block` 之前 probe？可以但不会发生，因为：
+
+- 两个驱动的 probe 函数对 eMMC 卡都会返回 0（都支持）
+- 但 `mmc_block` 先注册 → 先被 `bus_for_each_drv` 遍历到 → probe 成功 → `__device_attach_driver` 返回 1 → **循环中断** → `mmc_test` 不会被轮到
+
+如果反过来（`mmc_test` 先注册），它确实会先绑定设备，然后循环中断，`mmc_block` 根本没机会被遍历到——结果就是没有 `/dev/mmcblk1`。**这正是为什么生产系统中只让一个驱动（mmc_block）注册到 MMC 总线的原因**——内核不依靠"刚好链接顺序对"来保证正确性。
+
+手动 bind 也是如此。通过 sysfs 手动绑定：
+
+```bash
+echo mmc1:0001 > /sys/bus/mmc/drivers/mmc_test/bind
+```
+
+底层走 `device_driver_attach()` → `__driver_probe_device()` → 同样检查 `dev->driver` → **`-EBUSY`**。必须先 unbind：
+
+```bash
+echo mmc1:0001 > /sys/bus/mmc/drivers/mmcblk/unbind   # 清空 dev->driver
+echo mmc1:0001 > /sys/bus/mmc/drivers/mmc_test/bind    # 再绑 mmc_test
+```
+
+**总结：MMC 总线没有 vendor/device ID 表，也没有 match 回调。所有驱动都被"放行"尝试 probe，一旦某个驱动 probe 成功，`__device_attach_driver` 返回 1 中断 `bus_for_each_drv` 循环。`dev->driver` 门卫是防止二次绑定的辅助安全机制。** 过滤由 probe 函数自检完成——`mmc_blk_probe` 检查 `CCC_BLOCK_READ`。ATK 板只有一个 `mmc_block` 驱动，所以匹配过程只遍历一次、直接通过、绑定完成。
+
+### 4.5.3 `mmc_blk_probe()` — 逐步骤分析
 
 **入口：** `drivers/mmc/core/block.c:3007`
 
@@ -3588,26 +3830,26 @@ static int mmc_blk_probe(struct mmc_card *card)
     struct mmc_blk_data *md;
     int ret = 0;
 
-    /* ① 安全检查：卡是否支持块读命令类 */
+    // ── ① 安全检查 ──────────────────────────────────
     if (!(card->csd.cmdclass & CCC_BLOCK_READ))
         return -ENODEV;
 
     mmc_fixup_device(card, mmc_blk_fixups);
 
-    /* ② 创建完成通知工作队列 */
+    // ── ② 工作队列 ──────────────────────────────────
     card->complete_wq = alloc_workqueue("mmc_complete",
                             WQ_MEM_RECLAIM | WQ_HIGHPRI, 0);
 
-    /* ③ 分配主分区块设备数据 */
-    md = mmc_blk_alloc(card);           // → 创建 /dev/mmcblk1
+    // ── ③ 主分区块设备 ───────────────────────────────
+    md = mmc_blk_alloc(card);           // → /dev/mmcblk1
 
-    /* ④ 创建硬件子分区 */
+    // ── ④ 硬件子分区 ────────────────────────────────
     ret = mmc_blk_alloc_parts(card, md); // → boot0, boot1, rpmb
 
-    /* ⑤ debugfs 接口 */
+    // ── ⑤ DebugFS 诊断接口 ──────────────────────────
     mmc_blk_add_debugfs(card, md);
 
-    /* ⑥ 运行时电源管理 */
+    // ── ⑥ 运行时电源管理 ────────────────────────────
     pm_runtime_set_autosuspend_delay(&card->dev, 3000);
     pm_runtime_use_autosuspend(&card->dev);
     pm_runtime_set_active(&card->dev);
@@ -3617,9 +3859,201 @@ static int mmc_blk_probe(struct mmc_card *card)
 }
 ```
 
-四个操作对应四个核心数据结构创建。下面逐一展开最关键的 ③ 和 ④。
+下面对不在其他节详细展开的步骤（①、②、⑤、⑥）做细致分析。③ 和 ④ 的展开见 4.5.4 和 4.5.5。
+
+---
+
+#### ① `CCC_BLOCK_READ` + `mmc_fixup_device`
+
+**`CCC_BLOCK_READ` 过滤器：**
+
+`card->csd.cmdclass` 是从 CSD 寄存器读取的位图，每位表示卡支持的一组命令：
+
+```c
+#define CCC_BLOCK_READ   (1 << 5)   /* CMD17: READ_SINGLE_BLOCK */
+                                     /* CMD18: READ_MULTIPLE_BLOCK */
+```
+
+eMMC 芯片必须支持块读命令，否则 `mmc_block` 驱动拒绝绑定。这本质上就是 4.5.2 节讨论的 probe 自检过滤——`mmc_blk_probe` 用 `CCC_BLOCK_READ` 确认卡是可寻址的块设备。
+
+**`mmc_fixup_device()` — 怪癖补丁：**
+
+```c
+/* quirks.h:218 */
+static inline void mmc_fixup_device(struct mmc_card *card,
+                                    const struct mmc_fixup *table)
+{
+    for (f = table; f->vendor_fixup; f++) {
+        /* CID 匹配：制造商、OEM、产品名、版本 */
+        if (f->manfid != CID_MANFID_ANY &&
+            f->manfid != card->cid.manfid) continue;
+        if (f->name != CID_NAME_ANY &&
+            strncmp(f->name, card->cid.prod_name, ...)) continue;
+        if (rev < f->rev_start || rev > f->rev_end) continue;
+        ...
+
+        /* 匹配成功 → 调用回调设置怪癖标志 */
+        f->vendor_fixup(card, f->data);
+    }
+}
+```
+
+`mmc_blk_fixups` 表（`quirks.h:40`）包含针对特定 eMMC/SD 芯片的硬件 bug 补偿。例如：
+
+```c
+static const struct mmc_fixup __maybe_unused mmc_blk_fixups[] = {
+    /* SanDisk iNAND: CMD38 参数通过 EXT_CSD[113] 传递 */
+    MMC_FIXUP("SEM02G", CID_MANFID_SANDISK, 0x100, add_quirk,
+              MMC_QUIRK_INAND_CMD38),
+    ...
+    END_FIXUP
+};
+```
+
+`mmc_fixup_device()` 在 CID 维度（制造商+产品名+版本号）匹配，命中后设置 `card->quirks` 标志位。后续 MMC 核心代码在发出特定命令时检查这些标志，采用替代流程绕过硬件 bug。
+
+ATK 板的 eMMC（制造商 ID 通常为 0x15 的 Samsung 或 0x45 的 SanDisk）如果不在 `mmc_blk_fixups` 表中，则跳过。
+
+---
+
+#### ② `card->complete_wq` — 块请求完成工作队列
+
+先想一个问题：**为什么 `mmc_blk_probe()` 需要创建一个工作队列？**
+
+块设备 I/O 的典型路径：
+
+```
+应用程序 write(buf)
+  ① syscall → VFS → 文件系统 → block layer
+  ② mmc 驱动发送 CMD25 (多块写)
+  ③ eMMC 卡执行写入，此时 CPU 可以干别的事
+  ④ 卡完成后触发中断
+  ⑤ 中断处理程序 → mmc_request_done()
+  ⑥ 唤醒应用程序 → write() 返回
+```
+
+问题在 ⑤→⑥ 之间：**中断处理程序运行在原子上下文中**。在 Linux 中，硬中断处理程序不能调用会睡眠的函数——不能获取信号量、不能调 `wake_up()`、不能调 `complete()`。但 ⑥ 恰恰需要这些操作。
+
+所以需要一个**工作队列**（workqueue）：中断处理程序把"唤醒应用程序"这件事打包成一个 work item，扔到队列里，然后退出中断。内核线程（kworker）会在进程上下文中取出这个 item 执行——此时可以安全地调用 `wake_up()`。
+
+```
+中断上下文                  进程上下文 (kworker)
+┌──────────────┐          ┌──────────────────┐
+│  mmc_request_done()     │  complete_wq 线程  │
+│    queue_work(↑) ──────→│    wake_up()      │
+│    return IRQ_HANDLED   │    ...            │
+└──────────────┘          └──────────────────┘
+```
+
+但这里有两个潜在问题，决定了 `alloc_workqueue()` 的两个 flag：
+
+**问题 1：内存回收死锁（`WQ_MEM_RECLAIM`）**
+
+假设系统内存不足，内核要回收内存。回收的一种方式是写回脏页：
+
+```
+kswapd (内存回收)
+  └─ 写回脏页 → 提交块 I/O → eMMC 开始写
+        └─ I/O 完成 → 中断 → queue_work(complete_wq, item)
+             └─ 分配内存给 work item  → 但系统正在回收内存！
+                  └─ 等内存回收完成 → 等 I/O 完成 → 死锁！
+```
+
+`WQ_MEM_RECLAIM` 解决这个死锁：它告诉内核"这个工作队列参与内存回收路径"。内核会为这类队列预留一个"内存回收专用"的 worker 线程，该线程有保留的内存池，即使在内存紧张时也能正常运行。没有这个 flag，上述死锁就会发生。
+
+**问题 2：完成延迟（`WQ_HIGHPRI`）**
+
+工作队列中的 item 由 kworker 线程池执行。默认情况下，kworker 和其他普通线程一样参与调度。如果系统中有大量其他工作项排队，块 I/O 的完成处理可能会被延迟。
+
+`WQ_HIGHPRI` 让这个队列的 work item 以高优先级调度——它们不会被普通工作项堵塞在队列里。这对块设备很重要：应用程序的 `read()`/`write()` 等待 I/O 完成才能返回，延迟直接体现为应用的响应时间。
+
+所以：
+
+```c
+card->complete_wq = alloc_workqueue("mmc_complete",
+                        WQ_MEM_RECLAIM | WQ_HIGHPRI, 0);
+```
+
+| flag | 解决什么问题 |
+|------|------------|
+| `WQ_MEM_RECLAIM` | 防止内存回收 → 等 I/O → 等 workqueue → 死锁 |
+| `WQ_HIGHPRI` | 防止 I/O 完成被其他工作项排队耽误 |
+
+---
+
+#### ⑤ `mmc_blk_add_debugfs()` — 诊断接口
+
+```c
+/* block.c:2958 */
+static void mmc_blk_add_debugfs(struct mmc_card *card, struct mmc_blk_data *md)
+{
+    if (!card->debugfs_root)
+        return;                             // debugfs 未挂载
+
+    if (mmc_card_mmc(card) || mmc_card_sd(card)) {
+        md->status_dentry = debugfs_create_file_unsafe(
+                "status", 0400, root, card, &mmc_dbg_card_status_fops);
+    }
+    if (mmc_card_mmc(card)) {
+        md->ext_csd_dentry = debugfs_create_file(
+                "ext_csd", S_IRUSR, root, card, &mmc_dbg_ext_csd_fops);
+    }
+}
+```
+
+创建两个 debugfs 节点：
+
+- **`/sys/kernel/debug/mmc1/status`** — 读取时通过 CMD13 获取卡状态寄存器（`SEND_STATUS`），输出 4-bit 状态码 + 就绪/忙标志
+- **`/sys/kernel/debug/mmc1/ext_csd`** — 读取时通过 CMD8 重新读取 512 字节 EXT_CSD，以 hex dump 形式输出。可用于运行时检查当前时序模式、擦除计数、寿命估计等
+
+这些接口在调试阶段非常有用——不需要 `mmc-utils`，直接 `cat` 即可查看卡状态。
+
+---
+
+#### ⑥ 运行时电源管理
+
+4 行调用配置了 MMC 卡设备（`card->dev`）的 runtime PM：
+
+```c
+pm_runtime_set_autosuspend_delay(&card->dev, 3000);   // ① 3 秒延迟
+pm_runtime_use_autosuspend(&card->dev);                // ② 启用自动暂停
+pm_runtime_set_active(&card->dev);                     // ③ 初始状态：激活
+pm_runtime_enable(&card->dev);                         // ④ 启用 runtime PM
+```
+
+执行后，MMC 卡在无 I/O 请求 **3 秒后**自动进入低功耗状态：
+
+```
+  最后一次 I/O 完成
+        │
+        ▼
+  计时器开始计时 (3s)
+        │
+        ▼ 3 秒内无新 I/O
+  pm_runtime_put → suspend callback → 卡进入休眠
+        │
+        ▼ 新 I/O 到来
+  pm_runtime_get → resume callback → 卡唤醒 → 执行 I/O → 重启计时器
+```
+
+这背后的回调（runtime PM 操作函数）定义在 `mmc_bus_type.pm`（`bus.c:214`）：
+
+```c
+static const struct dev_pm_ops mmc_bus_pm_ops = {
+    SET_RUNTIME_PM_OPS(mmc_runtime_suspend, mmc_runtime_resume, NULL)
+    ...
+};
+```
+
+`mmc_runtime_suspend` / `mmc_runtime_resume`（`bus.c:197-211`）调用 `host->bus_ops` 中定义的回调，最终由 `mmc_set_ios()` 调整时钟和电压。暂停状态下 eMMC 时钟被关闭，VCCQ 可降低到 1.2V（如果控制器支持）。
+
+---
+
+**小结：** `mmc_blk_probe()` 的 6 个步骤覆盖了从"卡是否符合块设备条件"到"块设备创建"到"运行时电源策略"的完整初始化。其中最核心的数据结构创建在 ③ 和 ④，详见后两节。
 
 ### 4.5.4 `mmc_blk_alloc()` → `mmc_blk_alloc_req()` — gendisk 的创建
+
+#### `mmc_blk_alloc()` — 容量的来源
 
 ```c
 /* block.c:2586 */
@@ -3628,21 +4062,123 @@ static struct mmc_blk_data *mmc_blk_alloc(struct mmc_card *card)
     sector_t size;
 
     if (!mmc_card_sd(card) && mmc_card_blockaddr(card)) {
-        /* eMMC: 容量来自 EXT_CSD sector count */
         size = card->ext_csd.sectors;   // = 30777344 → 14.6 GiB
     } else {
-        /* SD: 容量来自 CSD 字段 */
         size = (sector_t)card->csd.capacity << (card->csd.read_blkbits - 9);
     }
 
-    return mmc_blk_alloc_req(card, &card->dev,     // parent = card->dev
-                             size, false, NULL,
-                             MMC_BLK_DATA_AREA_MAIN,  // 主分区类型
-                             0);
+    return mmc_blk_alloc_req(card, &card->dev, size, false, NULL,
+                             MMC_BLK_DATA_AREA_MAIN, 0);
 }
 ```
 
-`mmc_blk_alloc_req()`（`block.c:2458`）是真正的 gendisk 创建点，完整源码如下：
+这段代码的核心问题是：**eMMC 卡的容量存在两个地方，用哪个？**
+
+条件 `!mmc_card_sd(card) && mmc_card_blockaddr(card)` 决定了走哪条路：
+
+- `!mmc_card_sd(card)` — 不是 SD 卡（即 eMMC 卡）
+- `mmc_card_blockaddr(card)` — 使用块寻址（而非字节寻址）
+
+`mmc_card_blockaddr()` 检查 `card->state & MMC_STATE_BLOCKADDR`，这个标志在 `mmc_decode_ext_csd()` 中设置（`mmc.c:416`）：
+
+```c
+/* Cards with density > 2GiB are sector addressed */
+if (card->ext_csd.sectors > (2u * 1024 * 1024 * 1024) / 512)
+    mmc_card_set_blockaddr(card);
+```
+
+**容量超过 2 GiB 的卡才使用块寻址**。ATK 板 14.6 GiB 的 eMMC 显然满足。
+
+```
+                       容量 > 2GiB？
+                      /            \
+                     YES            NO
+                      │              │
+              块寻址 eMMC        SD 卡或小容量卡
+                      │              │
+                      ▼              ▼
+            size = ext_csd.sectors    size = csd.capacity
+                                       << (read_blkbits - 9)
+                      │              │
+                      ▼              ▼
+              30777344 扇区        从 CSD 字段计算
+```
+
+**路径 1 — 大容量 eMMC（> 2 GiB）：**
+
+```c
+size = card->ext_csd.sectors;   // = 30777344
+```
+
+`ext_csd.sectors` 来自 EXT_CSD[212:215] **SEC_COUNT** 寄存器，4 字节小端整数，单位是 512 字节扇区：
+
+```c
+/* mmc.c:408-413 */
+card->ext_csd.sectors =
+    ext_csd[EXT_CSD_SEC_CNT + 0] << 0 |
+    ext_csd[EXT_CSD_SEC_CNT + 1] << 8 |
+    ext_csd[EXT_CSD_SEC_CNT + 2] << 16 |
+    ext_csd[EXT_CSD_SEC_CNT + 3] << 24;
+```
+
+30777344 扇区 × 512 字节 = 15757928448 字节 ≈ 14.6 GiB。这是最直接的容量来源，不需要任何换算。
+
+**路径 2 — SD 卡或小容量 eMMC（≤ 2 GiB）：**
+
+```c
+size = (sector_t)card->csd.capacity << (card->csd.read_blkbits - 9);
+```
+
+`card->csd.capacity` 和 `card->csd.read_blkbits` 在 `mmc_decode_csd()` 中从 CSD 寄存器解析（`mmc.c:173`）：
+
+```c
+csd->capacity     = (1 + m) << (e + 2);   // C_SIZE + C_SIZE_MULT → 块数
+csd->read_blkbits = UNSTUFF_BITS(resp, 80, 4);  // READ_BL_LEN，通常为 10（1024 字节/块）
+```
+
+`<< (read_blkbits - 9)` 把块数转换为 512 字节扇区数：对于 `read_blkbits=10`（每块 1024 字节），需要每块折算为 2 个 512 字节扇区，即 `capacity << 1`。
+
+内核源码本身的注释（`block.c:2591-2600`）说得很清楚：
+
+```c
+if (!mmc_card_sd(card) && mmc_card_blockaddr(card)) {
+    /* The EXT_CSD sector count is in number of 512 byte sectors. */
+    size = card->ext_csd.sectors;
+} else {
+    /* The CSD capacity field is in units of read_blkbits.
+     * set_capacity takes units of 512 bytes. */
+    size = ...;
+}
+```
+
+**ATK 板走路径 1**。路径 2 主要是对 SD 卡和历史遗留的小容量 eMMC 的兼容。
+
+`mmc_blk_alloc_req()`（`block.c:2458`）是真正的 gendisk 创建点。它把 `mmc_blk_alloc()` 传进来的扇区数变成用户空间看到的 `/dev/mmcblk1`。
+
+**它在干什么？** 一个块设备在内核中有三个层级：
+
+```
+                  应用程序                         用户空间
+               ┌──────────┐
+               │ /dev/mmcblk1  │  ← 设备节点（通过文件系统访问）
+               └─────┬─────┘
+             ┌───────┴────────┐
+             │   gendisk      │   ← 通用磁盘层（管理分区、IO 调度）
+             │ (block_device) │
+             └───────┬────────┘
+             ┌───────┴────────┐
+             │   blk-mq queue │   ← 请求队列（IO 路径的核心）
+             │ (request_queue)│
+             └───────┬────────┘
+                     │
+              ┌──────┴──────┐
+              │  MMC 子系统  │
+              │  (mmc_wait_for_req → CMD) │
+```
+
+`mmc_blk_alloc_req()` 负责创建前三层（blk-mq 队列 + gendisk + 设备节点），并把它们串起来。它也负责配置写策略（缓存、FUA、可靠写）。
+
+完整源码如下，然后按执行顺序分 6 步解读：
 
 ```c
 /* block.c:2458 */
@@ -3742,42 +4278,64 @@ out:
 }
 ```
 
-然后按执行顺序分 6 步逐段解读：
+---
 
 #### ① 分配设备编号（devidx）
+
+**为什么需要这一步？** Linux 块设备层使用**主次设备号**（major/minor）唯一标识每个块设备。MMC 块设备使用静态主号 `MMC_BLOCK_MAJOR`（179），但系统可能挂载多个 `mmcblk` 设备（`mmcblk0`、`mmcblk1`、...），需要给每个设备分配不同的次号区间。`devidx` 就是一个全局递增的序号，用来计算次号偏移：
+
+```
+                同一个主号 179 下的次号空间
+  ┌─────────┬─────────┬─────────┬─────────┬─────────┐
+  │mmcblk0  │mmcblk1  │mmcblk2  │mmcblk3  │...      │  ← 每个占 8 个次号
+  │0 1...7  │8 9...15 │16...23  │24...31  │         │
+  └─────────┴─────────┴─────────┴─────────┴─────────┘
+               ↑
+          devidx = 1
+```
 
 ```c
 devidx = ida_simple_get(&mmc_blk_ida, 0, max_devices, GFP_KERNEL);
 ```
 
-`mmc_blk_ida` 是全局 ID 分配器，保证每个块设备有唯一的索引号。`devidx` 决定：
-- `mmcblk1` 中的数字 `1`（`card->host->index`，控制器序号）
-- 主次设备号：主号 `MMC_BLOCK_MAJOR`（179），次号 = `devidx × perdev_minors`
+`mmc_blk_ida` 是内核 IDA（ID Allocation）分配器，保证并发安全下分配不重复的整数索引。`devidx` 的值决定了第 ③ 步中的 `first_minor = devidx × perdev_minors`。
+
+注意磁盘名 `mmcblk1` 中的 `1` 并非来自 `devidx`——它来自 `card->host->index`，后者是 `mmc_alloc_host()` 中从 `mmc_host_ida` 分配的控制器序号。两个编号来自独立的 IDA 空间，数值上可能巧合相等（比如系统中只有一个 MMC 控制器时），但概念和用途完全不同：`devidx` 决定块设备次号，`host->index` 决定磁盘名前缀。
 
 #### ② `mmc_init_queue()` — blk-mq 请求队列初始化
+
+**为什么需要请求队列？** 应用程序读写文件（`dd if=/dev/mmcblk1`）产生的不是 "CMD17 读扇区 X" 这样的 MMC 命令——经过 VFS → 文件系统 → 块设备层，IO 被封装成 `struct request`。请求队列（request queue）是块设备层的核心抽象，承担三个职责：
+
+1. **合并与排序**：将相邻扇区的多个小 IO 合并成一个，减少 MMC 命令数量
+2. **异步提交**：请求提交后不阻塞调用者，完成后通过回调通知
+3. **背压（backpressure）**：当队列深度已满时，阻塞上层继续提交，防止 IO 堆积
+
+`mmc_init_queue()` 初始化 **blk-mq**（Block Multi-Queue）——Linux v4.0+ 引入的新一代块层 IO 框架：
 
 ```c
 md->disk = mmc_init_queue(&md->queue, card);
 ```
 
-`mmc_init_queue()`（`queue.c:71`）初始化 **blk-mq**（Block Multi-Queue）框架：
-
 ```
 mmc_init_queue()
-  ├─ blk_mq_alloc_tag_set(&md->queue.tag_set)      ← 分配标签集（最大请求数）
-  │    tag_set->ops = &mmc_mq_ops                    ← 块层请求到 MMC 命令的转换
-  │    tag_set->nr_hw_queues = 1                     ← 单硬件队列
-  │    tag_set->queue_depth = num_tags               ← 队列深度（CMDQ 时为 32）
-  ├─ md->queue.queue = blk_mq_init_queue(&tag_set)   ← 创建请求队列
-  ├─ blk_queue_prep_rq                               ← 准备请求
-  └─ md->disk = alloc_disk(perdev_minors)            ← 分配 gendisk
+  ├─ blk_mq_alloc_tag_set(&md->queue.tag_set)      ← 分配标签集（跟踪飞行中的请求）
+  │    tag_set->ops = &mmc_mq_ops                    ← 块层请求 → MMC 命令的转换层
+  │    tag_set->nr_hw_queues = 1                     ← 单硬件队列（MMC 无需多队列）
+  │    tag_set->queue_depth = num_tags               ← 队列深度（有 CMDQ 时 = 32）
+  ├─ md->queue.queue = blk_mq_init_queue(&tag_set)   ← 创建请求队列实例
+  ├─ blk_queue_prep_rq                               ← 注册请求准备回调
+  └─ md->disk = alloc_disk(perdev_minors)            ← 分配 gendisk 结构体
 ```
 
-**blk-mq 是 Linux 块层的多队列框架**（v4.0+）。单队列（blk-sq）时代所有 IO 请求竞争一把锁，多队列将 IO 路径分级：软件队列负责分发，硬件队列直接映射到 DMA 通道。MMC 只用单队列（`nr_hw_queues = 1`），但使用了 blk-mq 框架带来的异步完成和标记调度。
+blk-mq 相比旧版单队列（blk-sq）的核心改进是**标记调度（tag-based scheduling）**：每个飞行中的请求分配一个唯一标记（tag），块层和驱动通过 tag 跟踪完成状态，避免了旧版遍历队列的锁竞争。MMC 只用单队列（`nr_hw_queues = 1`），但受益于 blk-mq 的异步完成和标记管理。
 
-**`mmc_mq_ops`** 是 MMC 块层实现的关键——它将 `blk_mq_ops.queue_rq()` 转换为 `mmc_blk_mq_issue_rq()`，后者根据请求类型分发到读/写/DISCARD/FLUSH 处理函数，最终调用 `mmc_wait_for_req()` 执行 CMD+数据传输。
+**`mmc_mq_ops`** 是连接块层和 MMC 驱动的桥梁——它将 `blk_mq_ops.queue_rq()` 的通用块请求转化为 `mmc_blk_mq_issue_rq()`，后者根据请求类型（读/写/DISCARD/FLUSH）分发到对应处理函数，最终调用 `mmc_wait_for_req()` 执行 CMD + 数据传输。
+
+注意到 `mmc_init_queue()` 同时做了两件事：创建 blk-mq 队列 **和** 分配 gendisk 结构体（`alloc_disk`）。但此时 gendisk 还是个空壳——属性填充是第 ③ 步的工作。
 
 #### ③ gendisk 属性设置
+
+**为什么需要这一步？** 第 ② 步的 `alloc_disk()` 只分配了 `struct gendisk` 的空壳（一块内存）。但内核还不知道这个磁盘的名字、容量、操作函数。这一步填充 gendisk 的元数据字段，为第 ⑥ 步的 `device_add_disk()` 正式注册做准备。
 
 ```c
 md->disk->major       = MMC_BLOCK_MAJOR;          // 179
@@ -3797,7 +4355,19 @@ if (area_type == MMC_BLK_DATA_AREA_MAIN)
     dev_set_drvdata(&card->dev, md);
 ```
 
-`perdev_minors = 8` 意味着每个 `mmcblk1` 占用 8 个次设备号：`mmcblk1` 本身 + 6 个分区（`mmcblk1p1`~`mmcblk1p6`）+ 1 个保留。
+逐字段说明：
+
+| 字段 | 值 | 作用 |
+|------|-----|------|
+| `major` | `MMC_BLOCK_MAJOR`（179） | MMC 块设备静态主号，所有 `mmcblk*` 共享 |
+| `first_minor` | `devidx × 8` | 次号起始偏移，8 为步长 |
+| `minors` | `perdev_minors`（8） | 每个磁盘占 8 个次号（磁盘本身 + 最多 6 分区 + 保留） |
+| `fops` | `&mmc_bdops` | 块设备操作表 |
+| `private_data` | `md` | IO 路径中通过 `disk->private_data` 回溯到 `mmc_blk_data` |
+| `disk_name` | `"mmcblk1"` | 命名规则 `mmcblk<host_index>` |
+| `capacity` | `set_capacity(disk, size)` | 通告块层容量 = 30777344 扇区 = 14.6 GiB |
+
+对于 boot/RPMB 分区，还设置 `GENHD_FL_NO_PART` 标志避免分区表扫描（它们不是可分区介质）。
 
 `mmc_bdops` 定义了块设备操作表：
 
@@ -3808,14 +4378,16 @@ static const struct block_device_operations mmc_bdops = {
     .release     = mmc_blk_release,
     .ioctl       = mmc_blk_ioctl,         // 主设备 ioctl
     .compat_ioctl= mmc_blk_compat_ioctl,  // 32-bit 兼容
-    .getgeo      = mmc_blk_getgeo,        // 磁盘几何信息
+    .getgeo      = mmc_blk_getgeo,        // 磁盘几何信息（CHS 参数）
     .owner       = THIS_MODULE,
 };
 ```
 
-`mmc_blk_ioctl` 是控制面的入口——`mmc-utils` 等工具通过它发送自定义命令。
+其中 `mmc_blk_ioctl` 是控制面入口——`mmc-utils` 等工具通过它发送 RAW 的 MMC 命令（如 CMD8 读 EXT_CSD、CMD13 读状态）。这个 ioctl 走的是块设备主设备号（179），和 4.2 节中注册的字符设备（主号动态分配）是两条独立的控制路径，都可以发 RAW 命令。
 
-#### ④ CMD23 支持检测
+#### ④ CMD23 可靠写检测
+
+**为什么需要可靠写？** 多块写（CMD25）期间如果发生电源故障或总线错误，卡可能只写了部分块——静默的数据损坏。传统的多块写流程是 "CMD25 + CMD12（停止）"，没有校验机制。**CMD23（SET_BLOCK_COUNT）** 在 CMD25 之前告诉卡"这次要写 N 块"，卡可以对比实际收到的数据块数是否匹配——不匹配则放弃本次写入。这就是"可靠写"（Reliable Write）的基本思想。
 
 ```c
 if (mmc_host_cmd23(card->host)) {
@@ -3824,14 +4396,28 @@ if (mmc_host_cmd23(card->host)) {
 }
 ```
 
-CMD23（SET_BLOCK_COUNT）用于**可靠写**——在 CMD25（多块写）前设置块数，卡在写入过程中自动检测错误。如果卡和 host 都支持 CMD23，设置 `MMC_BLK_CMD23` 标志。
+两个条件缺一不可：
+- `mmc_host_cmd23(card->host)`：host 侧控制器支持 CMD23（`host->caps & MMC_CAP_CMD23`）
+- `card->csd.mmca_vsn >= CSD_SPEC_VER_3`：卡侧协议版本 ≥ MMC v4.3（此版本起引入可靠写功能）
 
-#### ⑤ 可靠写/缓存/FUA 配置
+如果都满足，设置 `MMC_BLK_CMD23` 标志。这个标志在第 ⑤ 步中用于判断是否启用可靠写和 FUA——注意它只是个前提条件，最终的可靠写启用还依赖 EXT_CSD 中的其他参数。
+
+#### ⑤ 缓存与 FUA — 硬件操作在哪里？
+
+**为什么需要这一步？** 应用层调 `sync()` 或者文件系统写 journal，最终都需要确保数据真正落在了 Flash 上，而不是停留在 eMMC 内部的缓存里。这一步就是告诉块层"这个 eMMC 支持什么写保证策略"，让块层在需要时能发出正确的命令。
+
+先看三个概念在 eMMC 硬件层面的真实操作：
+
+| 概念 | 块层抽象 | eMMC 硬件实际执行 |
+|------|---------|-----------------|
+| **Write Cache** | `QUEUE_FLAG_WC` | eMMC 内部 SRAM 缓存，CMD6 写 EXT_CSD 字节 33=1 开启 |
+| **FLUSH** | `REQ_PREFLUSH` | CMD6 写 EXT_CSD 字节 32（写任意值触发卡内部刷写），eMMC 将缓存刷入 Flash |
+| **FUA** | `REQ_FUA` | CMD23 bit 31=1，eMMC 保证数据直写非易失介质 |
 
 ```c
 if (md->flags & MMC_BLK_CMD23 &&
-    ((card->ext_csd.rel_param & EXT_CSD_WR_REL_PARAM_EN) ||   // 可靠写参数使能
-     card->ext_csd.rel_sectors)) {                               // 可靠写扇区数
+    ((card->ext_csd.rel_param & EXT_CSD_WR_REL_PARAM_EN) ||
+     card->ext_csd.rel_sectors)) {
     md->flags |= MMC_BLK_REL_WR;
     fua_enabled = true;
     cache_enabled = true;
@@ -3842,28 +4428,270 @@ if (mmc_cache_enabled(card->host))
 blk_queue_write_cache(md->queue.queue, cache_enabled, fua_enabled);
 ```
 
-`blk_queue_write_cache()` 向块层通告写缓存和 FUA（Force Unit Access）能力——文件系统用此判断是否需要发送 FLUSH 命令。
+##### Write Cache 到底在硬件哪里开启的？
+
+eMMC 的写缓存在**卡初始化阶段**（`mmc_init_card()`，详见 4.4.5.8 节）就已经通过 CMD6 写 `EXT_CSD_CACHE_CTRL`（字节 33）= 1 开启了，不在这一步。
+
+第 ⑤ 步中的 `mmc_cache_enabled()` 只是检查 `card->ext_csd.cache_ctrl == 1`——读一下初始化阶段已经设好的标志，**不是在这里开缓存**。
+
+那 FLUSH 写的是哪个？**字节 32（`EXT_CSD_FLUSH_CACHE`）**，和字节 33 是两个独立的寄存器。写任意值到字节 32 触发 eMMC 内部缓存刷写，不改变缓存开关状态。详见下面的 FLUSH 分析。
+
+##### FLUSH 操作 eMMC 缓存吗？
+
+**是的**。应用 `sync()` / `fsync()` → 文件系统发 journal commit → 块层收到 `REQ_OP_FLUSH` → `mmc_blk_issue_flush()`：
+
+```c
+/* block.c:1276 */
+static void mmc_blk_issue_flush(struct mmc_queue *mq, struct request *req)
+{
+    ret = mmc_flush_cache(card->host);
+    blk_mq_end_request(req, ret ? BLK_STS_IOERR : BLK_STS_OK);
+}
+```
+
+最终执行 `_mmc_flush_cache()`（`mmc.c:2087`）：
+
+```c
+static int _mmc_flush_cache(struct mmc_host *host)
+{
+    if (_mmc_cache_enabled(host)) {
+        err = mmc_switch(host->card, EXT_CSD_CMD_SET_NORMAL,
+                         EXT_CSD_FLUSH_CACHE, 1,   // ← 字节 32，值任意
+                         CACHE_FLUSH_TIMEOUT_MS);
+        // ↑ CMD6 写 EXT_CSD[32]（FLUSH_CACHE），卡收到后刷内部缓存
+    }
+    return err;
+}
+```
+
+**FLUSH 的硬件操作就是 CMD6**，写 EXT_CSD[32]（FLUSH_CACHE 寄存器，写任意值触发刷写）。eMMC 收到后启动内部 FSM，把 SRAM 缓存中的脏数据写入 Flash 阵列。
+
+##### sync() 到底做了什么？
+
+很多人以为 `sync()` 就是"把 DDR 里的数据刷到 eMMC Flash 上"，这是错觉。`sync()` 实际做了**两件事**，数据经历了**两级缓存**：
+
+```
+                         DDR                        eMMC 芯片内部
+应用程序 write(fd, buf)
+    │
+    ▼  ① 数据复制到 page cache，write 立即返回
+ ┌──────────┐
+ │ page cache│  ← DDR 中的文件缓存页（脏页）
+ └─────┬────┘
+       │  ② writeback（sync 前半段）
+       │  ⚡ DMA 传输
+       ▼
+ ┌──────────┐
+ │ SRAM Cache│  ← eMMC 芯片内部的硬件写缓存
+ └─────┬────┘
+       │  ③ FLUSH（sync 后半段）
+       │  CMD6 写 EXT_CSD[32]
+       ▼
+ ┌──────────┐
+ │ Flash 阵列│  ← 真正持久化存储
+ └──────────┘
+```
+
+**第一级：DDR 中的 page cache。** 应用程序调 `write()` 时，数据先被复制到内核的 page cache（DDR 中），`write` 立即返回。此时如果掉电，数据丢失。`sync()` 的前半段通过 writeback 机制把这些脏页提交到块设备层，经 DMA 传输到 eMMC 内部的 SRAM 写缓存。
+
+**第二级：eMMC 内部的 SRAM 写缓存。** 数据到达这里时，对 `sync()` 来说"写入"已经完成了，但 eMMC 还没把数据搬到 Flash 介质上。此时掉电同样丢数据。`sync()` 的后半段通过 FLUSH 命令（CMD6 FLUSH_CACHE）让 eMMC 把 SRAM 中的数据刷入 Flash 阵列。
+
+整个过程 `sync()` 不会刷"所有 DDR 内存"——匿名页（堆、栈、匿名 mmap）不属于任何文件，page cache 不涉及它们。`sync()` 只提交文件对应的脏 page cache，然后发 FLUSH。
+
+回到 `fsync(fd)`：它比 `sync()` 多一步——先通过 `filemap_fdatawrite()` 把指定文件的脏 page cache 提交到块层，再调 `blkdev_issue_flush()` 发 FLUSH。区别在于 `sync()` 全局，`fsync()` 只搞一个文件。
+
+##### FUA 在 eMMC 上怎么实现的？
+
+FUA 不靠 FLUSH，靠 **CMD23 可信写（Reliable Write）**。写路径中（`mmc_blk_mq_issue_rw_rq`，`block.c:1709`）：
+
+```c
+brq->sbc.opcode = MMC_SET_BLOCK_COUNT;        // CMD23
+brq->sbc.arg    = brq->data.blocks |
+                  (do_rel_wr ? (1 << 31) : 0); // bit 31 = 可靠写
+brq->mrq.sbc = &brq->sbc;
+```
+
+其中 `do_rel_wr`（`block.c:1377`）：
+
+```c
+do_rel_wr = (req->cmd_flags & REQ_FUA) &&
+            rq_data_dir(req) == WRITE &&
+            (md->flags & MMC_BLK_REL_WR);
+```
+
+FUA 完整链路：
+
+```
+REQ_FUA → do_rel_wr → CMD23 bit 31=1 →
+CMD25(多块写) 前卡收到 CMD23 →
+卡保证所有数据块在返回前已写入非易失存储
+
+注意 CMD23 是**一次性**的——它只对紧随其后的那一次 CMD25 生效。eMMC 协议中，CMD23 设置的块数和可靠写位（bit 31）在每次数据传输命令完成后自动清除，不会跨命令保持。这就是为什么代码中每个写请求都独立判断 `do_rel_wr` 并重新设置 CMD23 参数。没有 CMD23 的 CMD25 就是普通多块写，不会继承上一次的可靠写状态。
+```
+
+##### 总结：数据完整性链路
+
+```
+应用层               块层                          MMC 硬件
+sync()/fsync()
+  ↓
+REQ_OP_FLUSH ─────> mmc_blk_issue_flush()
+                         ↓
+                    mmc_switch(CMD6, FLUSH_CACHE=0)
+                         ↓
+                    eMMC 刷内部缓存 → Flash 阵列
+
+REQ_FUA
+  ↓
+do_rel_wr ─────────> CMD23 bit 31 = 1 → CMD25
+                         ↓
+                    eMMC 保证直写非易失介质
+```
+
+`blk_queue_write_cache()` 向块层注册 `QUEUE_FLAG_WC` 和 `QUEUE_FLAG_FUA`。文件系统在挂载时读取这些标志，在 journal commit 等关键路径上自动附加 `REQ_PREFLUSH` 或 `REQ_FUA`——从应用 `sync()` 到 eMMC Flash 阵列的整条数据完整性链路至此打通。
+
 
 #### ⑥ `device_add_disk()` — 块设备节点创建
+
+**为什么最后一步是 `device_add_disk()`？** 前面五步（①~⑤）创建了所有内核数据结构——IDA 编号、blk-mq 请求队列、gendisk 属性填充——这些都藏在内核内存里，用户空间看不到。没有这个调用，就没有 `/dev/mmcblk1`，没有 `/sys/block/mmcblk1/`，udev 不会收到事件，文件系统无法挂载。`device_add_disk()` 是"把磁盘暴露给用户空间"的最后一步。
 
 ```c
 ret = device_add_disk(md->parent, md->disk, mmc_disk_attr_groups);
 ```
 
-这是块设备节点真正出现的时刻。`device_add_disk()` 内部：
+`device_add_disk()`（`genhd.c:394`）内部按以下步骤执行（先看完整时序概览，再分步解读）：
+##### 完整时序
 
 ```
-device_add_disk()
-  ├─ 注册 gendisk 到块设备层
-  ├─ 分配主/次设备号（MMC_BLOCK_MAJOR, first_minor）
-  ├─ 创建 inode (/dev/mmcblk1)
-  ├─ 注册 sysfs 属性组（mmc_disk_attr_groups）
-  ├─ 注册分区表 (genhd 分区扫描)
-  │    └─ 如果媒体上有 MBR/GPT，创建 mmcblk1p1, mmcblk1p2, ...
-  └─ 发送 uevent (udev 收到 → 自动创建 /dev/ 节点)
+device_add_disk(mmclbk1)
+  │
+  ├─ elevator_init_mq()          ← IO 调度器初始化
+  ├─ dev_set_uevent_suppress(1)  ← 抑制 uevent
+  ├─ device_add(ddev)            ← /sys/block/mmcblk1/ 出现
+  ├─ blk_register_queue()        ← /sys/.../queue/ 出现
+  ├─ bdev_add(part0, 179:0)      ← 块设备层注册
+  ├─ disk_scan_partitions()      ← 读 MBR/GPT，注册分区
+  ├─ dev_set_uevent_suppress(0)  ← 释放 uevent
+  ├─ disk_uevent(KOBJ_ADD)       ← udev → /dev/mmcblk1 创建
+  │
+  ▼
+用户空间看到 /dev/mmcblk1 和 /dev/mmcblk1p1...
 ```
 
-此时用户空间看到 `/dev/mmcblk1`，但此时卡上还没有 MBR/GPT——MBR 是用户部署镜像时写的，不是内核创建的。
+**`elevator_init_mq()` — IO 调度器初始化**
+
+为 blk-mq 队列选择一个默认 IO 调度器（如 mq-deadline）。对 eMMC 这类非机械介质效果有限，但保留框架允许用户切换：
+
+```bash
+echo none > /sys/block/mmcblk1/queue/scheduler
+```
+
+**主次设备号校验**
+
+MMC 使用静态主号 `MMC_BLOCK_MAJOR=179`，校验第 ③ 步设置的 `first_minor` 和 `minors` 是否越界（次号空间 0-255，每个磁盘 8 个）。
+
+**抑制 uevent + `device_add()`**
+
+```c
+dev_set_uevent_suppress(ddev, 1);     // 先抑制 uevent
+
+ddev->parent  = parent;               // → card->dev
+ddev->groups  = groups;               // → mmc_disk_attr_groups
+dev_set_name(ddev, "%s", disk->disk_name);  // → "mmcblk1"
+ddev->devt    = MKDEV(179, first_minor);    // → dev_t(179, 0)
+
+ret = device_add(ddev);               // 注册到驱动模型
+```
+
+设计意图：**先抑制 uevent（不让 udev 看见），再创建设备目录**。`device_add()` 创建 `/sys/devices/virtual/block/mmcblk1/` 和 `/sys/block/mmcblk1/` symlink，但由于 uevent 被抑制，udev 不会收到 `KOBJ_ADD`，`/dev/` 下还没有节点。
+
+**`blk_register_queue()` — 请求队列注册**
+
+在 `/sys/block/mmcblk1/queue/` 下暴露 IO 调度器、写缓存策略、IO 统计等参数。第 ⑤ 步设置的 `blk_queue_write_cache()` 在此刻生效——用户可通过 `write_cache` 文件看到当前策略是 "write back" 还是 "write through"。
+
+**`bdev_add()` — 块设备层注册**
+
+```c
+bdev_add(disk->part0, ddev->devt);
+```
+
+将 `disk->part0` 关联到 `dev_t(179, 0)`，加入块设备 inode 哈希表。此后内核可通过 `dev_t` 找到该块设备——但用户空间的 `/dev/` 节点还未出现（uevent 仍被抑制）。
+
+**分区扫描**
+
+```c
+if (get_capacity(disk))
+    disk_scan_partitions(disk, BLK_OPEN_READ);
+```
+
+读取 0 号扇区的 MBR/GPT。如果找到有效分区：
+
+- 为每个分区分配次设备号（`179:1`、`179:2`、...）
+- 创建分区的 `block_device`，调 `bdev_add()` 注册到块设备层
+
+如果 eMMC 是空白的（无 MBR/GPT），分区扫描 0 个分区，直接跳过。
+
+**释放 uevent — `/dev/` 节点创建**
+
+```c
+dev_set_uevent_suppress(ddev, 0);   // 释放抑制
+disk_uevent(disk, KOBJ_ADD);        // 发出 ADD 事件
+```
+
+udev 收到 `KOBJ_ADD`：
+
+```
+→ mknod /dev/mmcblk1 b 179 0
+→ 对所有已扫描的分区分别发 KOBJ_ADD
+→ /dev/mmcblk1p1, /dev/mmcblk1p2 ...
+```
+
+**关键时序：分区扫描在 uevent 之前完成。** 保证 udev 看到设备时，分区已就绪，不会出现"设备有了但分区还在创建"的竞态。
+
+**收尾**
+
+```c
+disk_update_readahead(disk);      // 设置预读大小
+disk_add_events(disk);            // 启用事件轮询
+set_bit(GD_ADDED, &disk->state);  // 标记已添加
+```
+
+##### 关于 `mmc_disk_attr_groups`
+
+```c
+/* block.c:2952 */
+static const struct attribute_group *mmc_disk_attr_groups[] = {
+    &mmc_disk_attr_group,   // force_ro
+    NULL,
+};
+```
+
+这些属性通过上面第 ③ 步的 `ddev->groups = groups` 传给 `device_add()`，sysfs 框架自动添加。最终出现在：
+
+```
+/sys/block/mmcblk1/force_ro
+/sys/block/mmcblk1boot0/force_ro
+```
+
+典型场景——更新 bootloader：
+
+```bash
+echo 0 > /sys/block/mmcblk1boot0/force_ro
+dd if=u-boot.stm32 of=/dev/mmcblk1boot0 bs=1M
+```
+
+需要 eMMC 的 `boot_ro_lock` 未被锁定（一次性熔丝位，锁定后无法逆转）。
+
+
+此时内核日志出现：
+
+```
+mmcblk1: mmc1:0001 H28U74301DMFPR-EG 14.6 GiB
+mmcblk1: p1  p2
+```
+
+这段日志来自 `mmc_blk_alloc_req()` 的最后几行（`block.c:4196`），打印磁盘名、CID 厂商信息、容量和分区列表——标志整个 eMMC 初始化流程完成，用户空间可通过 `/dev/mmcblk1` 正常访问 eMMC。
+
 
 ### 4.5.5 多硬件分区的生成 — `mmc_blk_alloc_parts()`
 
@@ -3930,12 +4758,12 @@ static int mmc_blk_alloc_parts(struct mmc_card *card, struct mmc_blk_data *md)
 
 每个硬件分区对应一个独立的 `mmc_blk_alloc_req()` 调用，生成独立的 gendisk：
 
-| 硬件分区 | 磁盘名称 | 次设备号 | area_type | 访问方式 |
-|---------|---------|---------|-----------|---------|
-| 用户数据区 | `mmcblk1` | 0-7 | `MAIN` | 常规块读写 |
-| Boot 0 | `mmcblk1boot0` | 8-15 | `BOOT` | 块读写（只读） |
-| Boot 1 | `mmcblk1boot1` | 16-23 | `BOOT` | 块读写（只读） |
-| RPMB | `mmcblk1rpmb` | 24-31 | `RPMB` | ioctl 专用 |
+| 硬件分区 | 磁盘名称 | 设备号 | area_type | 设备类型 | 访问方式 |
+|---------|---------|--------|-----------|---------|---------|
+| 用户数据区 | `mmcblk1` | 179:0-7 | `MAIN` | 块设备 | 常规块读写 |
+| Boot 0 | `mmcblk1boot0` | 179:8-15 | `BOOT` | 块设备 | 块读写（默认只读） |
+| Boot 1 | `mmcblk1boot1` | 179:16-23 | `BOOT` | 块设备 | 块读写（默认只读） |
+| RPMB | `mmcblk1rpmb` | 独立字符设备号 | `RPMB` | **字符设备** | ioctl 专用 |
 
 三个关键设计差异：
 
@@ -4017,7 +4845,7 @@ mmc_blk_alloc_parts()
                      │  CMD 序列完成         │
                      │  DDR52 @ 52MHz, 8-bit │
                      └──────────┬───────────┘
-                                │ mmc_add_card() → mmc_bus_match
+                                │ mmc_add_card() → __device_attach
                                 ▼
                      ┌──────────────────────┐
                      │  mmc_blk_probe()     │
