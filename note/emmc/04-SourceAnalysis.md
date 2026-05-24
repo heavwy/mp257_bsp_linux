@@ -4618,6 +4618,42 @@ bdev_add(disk->part0, ddev->devt);
 
 将 `disk->part0` 关联到 `dev_t(179, 0)`，加入块设备 inode 哈希表。此后内核可通过 `dev_t` 找到该块设备——但用户空间的 `/dev/` 节点还未出现（uevent 仍被抑制）。
 
+**整盘（part0）和分区的关系**
+
+从这一行开始，`gendisk` 有了自己的块设备接口。理解 `part0` 和分区的区别很重要：
+
+```
+gendisk (mmcblk1)
+  │
+  ├── part0（整盘，内嵌在 gendisk 中）    ← 代表物理 eMMC 芯片
+  │     │   block_device.bd_dev    = 179:0
+  │     │   block_device.bd_partno = 0
+  │     │   block_device.bd_inode  = bd_inode（拥有自己的 Page Cache）
+  │     │
+  │     └── bd_start_sect = 0
+  │         bd_nr_sectors = 15269888（整盘大小）
+  │
+  ├── queue（请求队列）                    ← 所有分区共用同一个队列
+  │
+  └── part_tbl（分区表）
+        │
+        ├── mmcblk1p1 (partno=1)
+        │     block_device.bd_dev    = 179:1
+        │     block_device.bd_start_sect = 8192     ← 偏移量
+        │     block_device.bd_inode  = bd_inode     ← 自己的 Page Cache
+        │
+        └── mmcblk1p2 (partno=2)
+              block_device.bd_dev    = 179:2
+              block_device.bd_start_sect = 1056768
+              block_device.bd_inode  = bd_inode     ← 自己的 Page Cache
+```
+
+关键点：
+- **`part0` 是 gendisk 自带的整盘块设备接口**，不是分区。它代表整张物理盘。
+- **分区没有自己的 gendisk 和请求队列**，它们共用 `gendisk->queue`。IO 请求到达分区设备时，blk-mq 在 bio 上加上 `bd_start_sect` 作为偏移，转成整盘 LBA 再下发。
+- **各分区有各自的 `bd_inode` 和 Page Cache**（因为分区是独立存储区域）。
+- **为什么要有 part0？** 读分区表需要从 LBA 0 读 MBR/GPT，这就是通过 `part0->bd_inode->i_mapping` 完成的。此外 `dd if=/dev/mmcblk1` 整盘备份也需要它。
+
 **分区扫描**
 
 ```c
