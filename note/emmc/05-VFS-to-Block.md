@@ -225,6 +225,18 @@ bd_inode
 
 不管从哪个路径打开，`blkdev_open` 都把 `filp->f_mapping` 替换成 `bd_inode->i_mapping`，保证缓存一致。
 
+**但分区之间是独立的。** `/dev/mmcblk1`（整盘）和 `/dev/mmcblk1p1`（分区 1）是两个不同的 `block_device`，各有各的 `bd_inode` 和 `i_mapping`：
+
+```
+设备号       bd_inode            i_mapping（Page Cache）
+───────     ────────────         ────────────────────────
+179:0       mmcblk1 (整盘)       → address_space (整盘)
+179:1       mmcblk1p1 (分区 1)   → address_space (分区 1) ← 互不共享
+179:2       mmcblk1p2 (分区 2)   → address_space (分区 2) ← 互不共享
+```
+
+因为分区是磁盘上独立的存储区域，缓存不需要跨分区共享。
+
 ---
 
 #### 小结：三个角色如何拼接

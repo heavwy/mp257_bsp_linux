@@ -4565,13 +4565,13 @@ ret = device_add_disk(md->parent, md->disk, mmc_disk_attr_groups);
 ```
 device_add_disk(mmclbk1)
   │
-  ├─ bdev_alloc(disk, 0)        ← ★ 分配 bd_inode + block_device（附 Page Cache）
+  ├─ bdev_alloc(disk, 0)        ← ★ 为 part0（整盘）分配 bd_inode + block_device
   ├─ elevator_init_mq()          ← IO 调度器初始化
   ├─ dev_set_uevent_suppress(1)  ← 抑制 uevent
   ├─ device_add(ddev)            ← /sys/block/mmcblk1/ 出现
   ├─ blk_register_queue()        ← /sys/.../queue/ 出现
   ├─ bdev_add(part0, 179:0)      ← 注册 bd_inode 到哈希表（设备号=inode 号）
-  ├─ disk_scan_partitions()      ← 读 MBR/GPT，注册分区
+  ├─ disk_scan_partitions()      ← 读 MBR/GPT，每个分区也调 bdev_alloc → 各有 bd_inode
   ├─ dev_set_uevent_suppress(0)  ← 释放 uevent
   ├─ disk_uevent(KOBJ_ADD)       ← udev → /dev/mmcblk1 创建
   │
