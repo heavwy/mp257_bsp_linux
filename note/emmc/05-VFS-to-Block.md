@@ -90,76 +90,164 @@ struct super_block {
 
 这就引出了块设备访问的一个关键认知：**裸设备绕过了文件系统层**。`read()` 从 `def_blk_fops` 直接进入块层通用函数（`blkdev_read_iter`），不需要经过 ext4/btrfs 等具体文件系统。当然后面挂载文件系统后（如 rootfs 用 ext4 挂在 eMMC 上），情况就不一样了——那时文件系统会管理数据布局，但那是另一个话题。
 
-### 5.3.2 inode —— 两个 inode 的拼接
+### 5.3.2 inode —— 两个 inode 各司其职
 
-块设备访问涉及 **两个不同的 inode**，容易混淆。
+块设备访问涉及 **两个不同的 inode**。要理解为什么有两个，先回答三个问题。
 
-**① 设备节点 inode（来自 devtmpfs）** — VFS 路径解析时找到的 inode：
+---
+
+#### 问题一：设备节点 inode 是什么？
+
+`open("/dev/mmcblk1")` 时，VFS 通过 devtmpfs 找到设备节点的 inode。它只做一件事——**告知块设备号**：
 
 ```c
+// include/linux/fs.h — inode 关键字段
 struct inode {
-    umode_t          i_mode;      // S_IFBLK → 标识这是个块设备文件
-    dev_t            i_rdev;      // 设备号（主/次设备号）
+    umode_t          i_mode;      // S_IFBLK → 标识为块设备文件
+    dev_t            i_rdev;      // 设备号（主/次），如 MKDEV(179, 1)
     const struct file_operations  *i_fop;  // → def_blk_fops
-    struct address_space          *i_mapping; // 设备节点的 Page Cache（不用）
     struct super_block            *i_sb;      // → devtmpfs 的 super_block
+    struct address_space          *i_mapping; // 不用于数据读写
     ...
 };
 ```
 
-当 `open("/dev/mmcblk1")` 时，VFS 通过 devtmpfs 找到这个 inode，从中读取设备号、设置 `f_op = def_blk_fops`。但这个 inode 的 `i_mapping` **不用于数据读写**。
+VFS 从中读出 `i_rdev = 179:1`，设置 `f_op = def_blk_fops`。然后它的任务就结束了。
 
-**② bd_inode（来自 bdev_inode）** — 块设备的内部 VFS inode，提供真正的 Page Cache：
+---
 
-```c
-// block/bdev.c:33 — bdev_inode 将 bdev 和 inode 打包在同一块内存中
-struct bdev_inode {
-    struct block_device bdev;      // 块设备
-    struct inode        vfs_inode; // ← 这就是 bd_inode 指向的 inode
-};
+#### 问题二：内核怎么从设备号找到块设备？
 
-// include/linux/blk_types.h:40 — block_device 中的 bd_inode 指针
-struct block_device {
-    ...
-    struct inode *bd_inode;  // 指向 bdev_inode.vfs_inode
-    ...
-};
-```
+字符设备用 `cdev_map`（设备号→cdev 的映射表），块设备不同——它有一个**内部的伪文件系统 `bdev`**。
 
-`bd_inode` 的 `i_mapping` 是块设备读写真正的 Page Cache 挂载点。从 `bd_inode` 反推 `block_device` 的宏：
+所有块设备的 `bd_inode` 都分配在这个伪文件系统下，**设备号就是 inode 号**：
 
 ```c
-// block/bdev.c:43
-struct block_device *I_BDEV(struct inode *inode)
+// block/bdev.c:385 — 为块设备分配 bd_inode
+struct block_device *bdev_alloc(struct gendisk *disk, u8 partno)
 {
-    return &BDEV_I(inode)->bdev;
-    // → container_of(inode, struct bdev_inode, vfs_inode)->bdev
+    inode = new_inode(blockdev_superblock);  // 从 bdev 伪文件系统分配 inode
+    ...
+    bdev = I_BDEV(inode);             // container_of: inode → block_device
+    bdev->bd_inode = inode;           // block_device → inode 回指
+    return bdev;
+}
+
+// block/bdev.c:426 — 注册到全局哈希表
+void bdev_add(struct block_device *bdev, dev_t dev)
+{
+    bdev->bd_inode->i_ino = dev;              // 设备号当成 inode 号
+    insert_inode_hash(bdev->bd_inode);        // 加入全局 inode 哈希表
 }
 ```
 
-**VFS 在 open 时把两者拼接起来：**
+查找时用设备号当 inode 号，在伪文件系统里哈希查找：
 
-```
-  设备节点 inode (devtmpfs)             bd_inode (bdev_inode)
-  ┌──────────────────────┐             ┌──────────────────────┐
-  │ i_rdev = 设备号       │             │ i_mapping → Page Cache│
-  │ i_fop  = def_blk_fops│             │ i_size  = 设备总扇区数│
-  │ i_sb   = devtmpfs    │             └──────────────────────┘
-  └─────────┬────────────┘                       │
-            │                                     │
-            │ blkdev_open() 读取 i_rdev 找到 bdev │
-            │ 然后做了一件事：                      │
-            │ filp->f_mapping = bdev->bd_inode->i_mapping
-            ▼                                     ▼
-   ┌─────────────────────────────────────────────────────┐
-   │ struct file                                         │
-   │  f_inode = 设备节点 inode  ←  VFS 自动赋值           │
-   │  f_op    = def_blk_fops   ←  来自设备节点 i_fop     │
-   │  f_mapping = bd_inode->i_mapping  ← blkdev_open 替换 │
-   └─────────────────────────────────────────────────────┘
+```c
+// block/bdev.c:704 — 通过设备号查找
+struct block_device *blkdev_get_no_open(dev_t dev)
+{
+    inode = ilookup(blockdev_superblock, dev); // dev = 179:1 就是 inode 号
+    if (!inode)
+        return NULL;
+    bdev = &BDEV_I(inode)->bdev;              // container_of 拿到 block_device
+    ...
+    return bdev;
+}
 ```
 
-所以 `bd_inode` **不是**设备节点的 inode。`blkdev_open` 从设备节点 inode 读设备号、取 `f_op`，再从 `bd_inode` 取 `i_mapping` 给 Page Cache 用——两个 inode 各司其职。
+整个 open 的查找链：
+
+```
+blkdev_open(inode)        ← 设备节点 inode（来自 devtmpfs）
+  ↓ i_rdev = 179:1
+blkdev_get_no_open(179:1)  ← 用设备号查
+  ↓ ilookup(blockdev_superblock, 179:1)  ← 在 bdev 伪文件系统里找
+bd_inode (i_ino = 179:1)  ← 找到了！
+  ↓ I_BDEV(inode) → container_of
+block_device (bdev)       ← 拿到块设备对象
+```
+
+| 对比 | 字符设备 | 块设备 |
+|------|---------|--------|
+| 查找结构 | `cdev_map`（kobj_map 表） | `bdev` 伪文件系统（hash 表） |
+| 查找函数 | `cdev_find()` | `ilookup(blockdev_superblock, dev)` |
+| 为什么不同 | 字符设备驱动动态注册，只须查 ops | 块设备需要 inode 挂载 Page Cache |
+
+---
+
+#### 问题三：bd_inode 和 i_mapping／Page Cache 是什么？
+
+块设备需要一个自己的 inode 是因为：**Page Cache 需要一个 `struct address_space` 来挂载**。
+
+```c
+// include/linux/fs.h:472 — Page Cache 管理器
+struct address_space {
+    struct inode              *host;       // 所属的 inode（回指 bd_inode）
+    struct xarray              i_pages;    // ★ 页缓存本体：页号 → folio 的索引
+    unsigned long              nrpages;    // 缓存的总页数
+    const struct address_space_operations *a_ops; // → 对块设备: blkdev_aops
+    ...
+};
+```
+
+Page Cache 的本质：**`i_pages` 是一个 xarray（类似 radix tree），以文件页号为 key，以 `struct folio *` 为 value**。
+
+```
+bd_inode
+  │
+  └── i_mapping ──→ address_space (Page Cache)
+                      │
+                      ├── i_pages: xarray
+                      │      ├── [页号 0] → folio_A (刚读入的扇区 0-7)
+                      │      ├── [页号 1] → folio_B (扇区 8-15)
+                      │      └── [页号 N] → ...
+                      │
+                      ├── a_ops: blkdev_aops
+                      │      .read_folio  = blkdev_read_folio   // 从 eMMC 读
+                      │      .dirty_folio = filemap_dirty_folio // 标记脏页
+                      │
+                      └── nrpages: 缓存命中总数
+```
+
+**为什么需要 `bd_inode` 而不是直接用设备节点 inode？** 因为同一个块设备可以通过多个路径访问，它们必须共享同一个 Page Cache：
+
+```
+/dev/mmcblk1  ──→ devtmpfs inode A ──┐
+                                      ├──→ Page Cache (同一份)
+/tmp/disk     ──→ devtmpfs inode B ──┘       ↑
+                                             │
+                                   ┌─────────┴────────────┐
+                                   │  bd_inode (唯一)      │
+                                   │  i_mapping = 这个缓存  │
+                                   └──────────────────────┘
+```
+
+不管从哪个路径打开，`blkdev_open` 都把 `filp->f_mapping` 替换成 `bd_inode->i_mapping`，保证缓存一致。
+
+---
+
+#### 小结：三个角色如何拼接
+
+```
+blkdev_open() 收到来自 devtmpfs 的设备节点 inode
+  │
+  ├── 读 i_rdev = 179:1          ← 设备节点 inode：告诉内核"找哪个设备"
+  ├── 读 i_fop → def_blk_fops    ← 设备节点 inode：告诉 VFS "用哪个操作表"
+  │
+  ├── blkdev_get_no_open(179:1)
+  │     → ilookup(blockdev_superblock, 179:1)  ← bdev 伪文件系统：按设备号查
+  │     → I_BDEV(inode) → block_device         ← container_of：拿块设备对象
+  │
+  └── filp->f_mapping = bdev->bd_inode->i_mapping
+                                    ← bd_inode：提供 Page Cache 挂载点
+```
+
+| 角色 | 是谁 | 存哪 | 做什么 |
+|------|------|------|--------|
+| 门牌 | 设备节点 inode | devtmpfs | 存设备号，供 VFS 路径解析 |
+| 索引 | `bdev` 伪文件系统 | `blockdev_superblock` | 设备号 → block_device 的哈希索引 |
+| 房间 | bd_inode | `bdev_inode`（内嵌在 block_device 旁） | 提供 Page Cache（`i_mapping`）|
 
 ### 5.3.3 dentry —— 路径名缓存
 
