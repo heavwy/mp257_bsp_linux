@@ -4,7 +4,7 @@
 > 从 `submit_bio` 进入块层开始，追踪 `dd read` / `dd write` / `sync` 三个真实情景在 MMC 核心层、Host 驱动、IDMA 硬件中的完整路径。
 >
 > **前置:** [05-VFS-to-Block.md](05-VFS-to-Block.md) — VFS 与块层通路（从系统调用到 submit_bio）
-> **下一篇:** [07-CQHCI.md](07-CQHCI.md)
+> **下一篇:** [07-Advanced.md](07-Advanced.md) — CQHCI 与 Tuning
 >
 > **字数：** 中文字数 8,302 + 英文单词 2,226 ≈ **10,528 字**（含代码段），**行数：1,475**
 >
@@ -1472,4 +1472,4 @@ Host:        mmci_request                mmci_request            mmci_request
 
 ---
 
-> **下一篇：** [07-CQHCI.md](07-CQHCI.md) — eMMC 5.1 Command Queue 硬件加速（CMD Queueing 和 CQE 引擎分析）。如果在 SD 卡或 eMMC 4.5 以下的系统中，这章用不上。但如果你手里的 eMMC 支持 HS200/HS400，CQHCI 是真正提升随机 IO 性能的引擎。
+> **下一篇：** [07-Advanced.md](07-Advanced.md) — CQHCI 与 Tuning（硬件命令队列和高速模式信号完整性）。CQHCI 是 eMMC 5.1 的硬件命令队列引擎，通过门铃模型让 eMMC 自主调度多笔请求。Tuning 是 HS200/HS400 高速模式必需的调相机制，通过 CMD21 扫描采样窗口。如果你用的是 DDR52 以下模式，Tuning 用不上；但理解 CQHCI 可以帮你从架构层面理解 MMC 子系统的极限。
