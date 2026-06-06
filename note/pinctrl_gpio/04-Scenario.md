@@ -970,7 +970,10 @@ map[3]: CONFIGS_GROUP, group="PA8", configs={bias-pull-up}
 
 **入口文件：** `pinctrl-stm32.c:852`
 
+node 参数：第一次调用时指向 pins1（PA4），第二次调用时指向 pins2（PA8）
+
 ```c
+// drivers/pinctrl/stm32/pinctrl-stm32.c:852
 static int stm32_pctrl_dt_subnode_to_map(struct pinctrl_dev *pctldev,
                       struct device_node *node,            // ← pins1 或 pins2
                       struct pinctrl_map **map,
@@ -989,45 +992,61 @@ static int stm32_pctrl_dt_subnode_to_map(struct pinctrl_dev *pctldev,
 
     pctl = pinctrl_dev_get_drvdata(pctldev);
 
-    // ① 读取 pinmux 属性
+    // ↓ 找到这个子节点的 "pinmux" 属性
+    //   对于 pins1：pinmux = <0x00000407>，pins->length = 4
+    //   对于 pins2：pinmux = <0x00000809>，pins->length = 4
     pins = of_find_property(node, "pinmux", NULL);
     if (!pins) {
         dev_err(pctl->dev, "missing pins property in node %pOFn .\n", node);
         return -EINVAL;
     }
 
-    // ② 可选引脚配置（bias, drive, slew-rate 等）
+    // ↓ 读取 pinconf 配置（bias, drive, slew-rate 等）
+    //   对于 pins1：有 bias-disable、drive-push-pull、slew-rate → num_configs=3
+    //   对于 pins2：只有 bias-pull-up → num_configs=1
     err = pinconf_generic_parse_dt_config(node, pctldev, &configs, &num_configs);
     if (err) return err;
     if (num_configs) has_config = 1;
 
-    // ③ 计算需要的 map 条目数
+    // ↓ 每个子节点只有 1 个 pinmux 值，所以 num_pins = 1
+    //   pins1 和 pins2 各只有 1 个 pin
     num_pins = pins->length / sizeof(u32);
+    // ↓ num_pins = 1（每个子节点只有 1 个 pin）
+    //   所以 maps_per_pin 计算如下：
+    //   pins1：有 pinmux（MUX map） + 有 pinconf（CONFIGS map）= 2 个 map
+    //   pins2：有 pinmux（MUX map） + 有 pinconf（CONFIGS map）= 2 个 map
     num_funcs = num_pins;
     maps_per_pin = 0;
-    if (num_funcs) maps_per_pin++;            // MUX map
-    if (has_config && num_pins >= 1) maps_per_pin++;  // CONFIGS map
+    if (num_funcs) maps_per_pin++;
+    if (has_config && num_pins >= 1) maps_per_pin++;
 
     if (!num_pins || !maps_per_pin) {
         err = -EINVAL;
         goto exit;
     }
 
-    reserve = num_pins * maps_per_pin;
-
+    // ↓ 给 map 数组扩容——确保至少有 reserve 个空位放即将生成的 map 条目
+    //   第一次调（pins1）：*reserved_maps=0, *num_maps=0, reserve=2
+    //     → krealloc 从 0 扩到 2
+    //   第二次调（pins2）：*reserved_maps=2, *num_maps=2, reserve=2
+    //     → old_num(2) < new_num(4)，krealloc 扩到 4
+    //   最后 map[] 数组里一共 4 个条目：PA4_MUX, PA4_CONF, PA8_MUX, PA8_CONF
     err = pinctrl_utils_reserve_map(pctldev, map,
             reserved_maps, num_maps, reserve);
     if (err) goto exit;
 
-    // ⑤ 遍历每个 pinmux 值
+    // ↓ num_pins = 1，所以只循环 1 次
     for (i = 0; i < num_pins; i++) {
+        // 对 pins1：pinfunc = 0x407（PA4 AF6 编码）
+        // 对 pins2：pinfunc = 0x809（PA8 AF8 编码）
         err = of_property_read_u32_index(node, "pinmux", i, &pinfunc);
         if (err) goto exit;
 
-        pin  = STM32_GET_PIN_NO(pinfunc);
-        func = STM32_GET_PIN_FUNC(pinfunc);
+        pin  = STM32_GET_PIN_NO(pinfunc);     // 0x407 >> 8 = 4  → PA4
+        func = STM32_GET_PIN_FUNC(pinfunc);   // 0x407 & 0xff = 7 → AF6 编码值
 
-        // 检查该 pin 是否支持此 function
+        // 检查 PA4 是否真的支持 function 7（af6）
+        // 查 pctl->match_data->pins[4] 中声明的 AF 列表
         if (!stm32_pctrl_is_function_valid(pctl, pin, func)) {
             err = -EINVAL;
             goto exit;
@@ -1044,6 +1063,16 @@ static int stm32_pctrl_dt_subnode_to_map(struct pinctrl_dev *pctldev,
                          map, reserved_maps, num_maps);
         if (err) goto exit;
 
+        // ↓ pinctrl_utils_add_map_configs(... grp->name, configs, num_configs, ...)
+        //   先 kmemdup 拷贝 pinconf 数组（因为 map 条目需要独立的内存所有权）
+        //   然后填入：
+        //     map[1].type = PIN_MAP_TYPE_CONFIGS_GROUP
+        //     map[1].data.configs.group_or_pin = "PA4"
+        //     map[1].data.configs.configs = {bias-disable, drive-push-pull, slew-rate=0}
+        //     map[1].data.configs.num_configs = 3
+        //   然后 *num_maps += 1
+        // 对 pins1：configs = {bias-disable, drive-push-pull, slew-rate=0}
+        // 对 pins2：configs = {bias-pull-up}
         if (has_config) {
             err = pinctrl_utils_add_map_configs(pctldev, map,
                     reserved_maps, num_maps, grp->name,
@@ -1056,6 +1085,80 @@ static int stm32_pctrl_dt_subnode_to_map(struct pinctrl_dev *pctldev,
 exit:
     kfree(configs);
     return err;
+}
+```
+
+**三个内部调用的源码分析**
+
+**① `stm32_pctrl_find_group_by_pin`**（pinctrl-stm32.c:789）
+遍历 `groups[]` 数组，按 pin 号匹配。对 PA4（pin=4）来说，找到 `groups[4]`：
+
+```c
+stm32_pctrl_find_group_by_pin(struct stm32_pinctrl *pctl, u32 pin)
+{
+    int i;
+
+    for (i = 0; i < pctl->ngroups; i++) {
+        struct stm32_pinctrl_group *grp = pctl->groups + i;
+
+        if (grp->pin == pin)        // pin=4 -> groups[4] 匹配
+            return grp;
+    }
+
+    return NULL;
+}
+```
+
+**② `stm32_pctrl_dt_node_to_map_func`**（pinctrl-stm32.c:832）
+往 `map[]` 数组当前位置填入 MUX 条目：
+
+```c
+static int stm32_pctrl_dt_node_to_map_func(struct stm32_pinctrl *pctl,
+        u32 pin, u32 fnum, struct stm32_pinctrl_group *grp,
+        struct pinctrl_map **map, unsigned *reserved_maps,
+        unsigned *num_maps)
+{
+    if (*num_maps == *reserved_maps)
+        return -ENOSPC;
+
+    (*map)[*num_maps].type = PIN_MAP_TYPE_MUX_GROUP;
+    (*map)[*num_maps].data.mux.group = grp->name;
+
+    if (!stm32_pctrl_is_function_valid(pctl, pin, fnum))
+        return -EINVAL;
+
+    (*map)[*num_maps].data.mux.function = stm32_gpio_functions[fnum];
+    (*num_maps)++;
+    return 0;
+}
+```
+
+**③ `pinctrl_utils_add_map_configs`**（pinctrl-utils.c:60）
+拷贝 pinconf 数组，填入 CONFIGS 条目：
+
+```c
+int pinctrl_utils_add_map_configs(struct pinctrl_dev *pctldev,
+        struct pinctrl_map **map, unsigned *reserved_maps,
+        unsigned *num_maps, const char *group,
+        unsigned long *configs, unsigned num_configs,
+        enum pinctrl_map_type type)
+{
+    unsigned long *dup_configs;
+
+    if (WARN_ON(*num_maps == *reserved_maps))
+        return -ENOSPC;
+
+    dup_configs = kmemdup(configs, num_configs * sizeof(*dup_configs),
+                          GFP_KERNEL);
+    if (!dup_configs)
+        return -ENOMEM;
+
+    (*map)[*num_maps].type = type;
+    (*map)[*num_maps].data.configs.group_or_pin = group;
+    (*map)[*num_maps].data.configs.configs = dup_configs;
+    (*map)[*num_maps].data.configs.num_configs = num_configs;
+    (*num_maps)++;
+    return 0;
 }
 ```
 
@@ -1242,25 +1345,33 @@ static int add_setting(struct pinctrl *p, struct pinctrl_dev *pctldev,
     struct pinctrl_setting *setting;
     int ret;
 
-    // ① 根据 map->name 找到或创建 state
+    // ↓ 根据 map->name 找到或创建对应的 pinctrl_state
+    //   传入的 map->name = "default"（在 dt_remember_or_free_map 中写入的 statename）
+    //   第一次遇到 "default" 时 create_state 创建一个新 state，之后第 2~4 个 map 直接 find_state 复用
+    //   对 USART2：state "default" 最终下挂 4 个 setting（PA4_MUX/PA4_CONF/PA8_MUX/PA8_CONF）
     state = find_state(p, map->name);
     if (!state)
         state = create_state(p, map->name);
     if (IS_ERR(state))
         return PTR_ERR(state);
 
-    // 跳过 dummy state
+    // 跳过 dummy state（USART2 的 map 类型是 MUX_GROUP 或 CONFIGS_GROUP，不会走这里）
     if (map->type == PIN_MAP_TYPE_DUMMY_STATE)
         return 0;
 
-    // ② 分配 setting 结构体
+    // ↓ 分配一个 pinctrl_setting 节点
     setting = kzalloc(sizeof(*setting), GFP_KERNEL);
     if (!setting)
         return -ENOMEM;
 
     setting->type = map->type;
+    // 第一次调：type = PIN_MAP_TYPE_MUX_GROUP
+    // 第二次调：type = PIN_MAP_TYPE_CONFIGS_GROUP
 
-    // ③ 找到 pctldev：优先用参数传入的，否则按名查找
+    // ↓ 找到这个 map 条目对应的 pin controller 设备
+    //   create_pinctrl 传进来的 pctldev = NULL（USART2 非 hog 场景）
+    //   所以走 else 分支：通过 map->ctrl_dev_name = "44240000.pinctrl" 查找
+    //   get_pinctrl_dev_from_devname 遍历 pinctrldev_list 匹配设备名
     if (pctldev)
         setting->pctldev = pctldev;
     else
@@ -1268,16 +1379,19 @@ static int add_setting(struct pinctrl *p, struct pinctrl_dev *pctldev,
             get_pinctrl_dev_from_devname(map->ctrl_dev_name);
     if (!setting->pctldev) {
         kfree(setting);
-        // hogs 无对应 pctldev → ENODEV，其他 → EPROBE_DEFER
+        // 如果是 hog 条目（ctrl_dev_name == dev_name），返回 ENODEV
         if (!strcmp(map->ctrl_dev_name, map->dev_name))
             return -ENODEV;
+        // 否则返回 EPROBE_DEFER——"44240000.pinctrl" 还没注册，USART2 probe 延后
         dev_info(p->dev, "unknown pinctrl device %s, deferring probe\n",
                  map->ctrl_dev_name);
         return -EPROBE_DEFER;
     }
-    setting->dev_name = map->dev_name;
+    setting->dev_name = map->dev_name;   // "usart2"
 
-    // ④ ★ 根据 map 类型填充 setting
+    // ↓ 根据 map 类型做对应的转换
+    //   对 MUX_GROUP：调 pinmux_map_to_setting，把 "PA4" → group_sel=4, "af6" → func=7
+    //   对 CONFIGS_GROUP：调 pinconf_map_to_setting，把 "PA4" → group_sel=4，configs 数组直接拷贝
     switch (map->type) {
     case PIN_MAP_TYPE_MUX_GROUP:
         ret = pinmux_map_to_setting(map, setting);
@@ -1295,7 +1409,11 @@ static int add_setting(struct pinctrl *p, struct pinctrl_dev *pctldev,
         return ret;
     }
 
-    // ⑤ 挂入 state->settings 链表
+    // ↓ 把这个 setting 挂到 "default" state 的 settings 链表末尾
+    //   第一次调后：state->settings = [PA4_MUX setting]
+    //   第二次调后：state->settings = [PA4_MUX, PA4_CONF]
+    //   第三次调后：state->settings = [PA4_MUX, PA4_CONF, PA8_MUX]
+    //   第四次调后：state->settings = [PA4_MUX, PA4_CONF, PA8_MUX, PA8_CONF]
     list_add_tail(&setting->node, &state->settings);
 
     return 0;
@@ -1317,6 +1435,8 @@ static int add_setting(struct pinctrl *p, struct pinctrl_dev *pctldev,
 **入口文件：** `drivers/pinctrl/pinmux.c:353`
 
 ```c
+// 输入 map: group="PA4"(字符串), function="af6"(字符串)
+// 输出 setting: group_sel=4(整数), func_sel=7(整数)
 int pinmux_map_to_setting(const struct pinctrl_map *map,
               struct pinctrl_setting *setting)
 {
@@ -1327,10 +1447,9 @@ int pinmux_map_to_setting(const struct pinctrl_map *map,
     int ret;
     const char *group;
 
-    // ① function 名 → 整数选择器
-    // 遍历 pctldev 的 functions[] 数组，比较字符串
-    // stm32_gpio_functions = {"gpio","af0","af1",...,"af6",...}
-    // "af6" 在索引 7 → 返回 selector = 7
+    // ↓ 把 function 字符串 "af6" 转成整数 7
+    //   内部遍历 pctldev 的 functions[] 数组（stm32_gpio_functions）
+    //   逐个比较字符串，找到 "af6" 在索引 7 处，返回 selector = 7
     ret = pinmux_func_name_to_selector(pctldev, map->data.mux.function);
     if (ret < 0) {
         dev_err(pctldev->dev, "invalid function %s in map table\n",
@@ -1339,7 +1458,9 @@ int pinmux_map_to_setting(const struct pinctrl_map *map,
     }
     setting->data.mux.func = ret;       // → 7
 
-    // ② 验证 function 关联的所有 group
+    // ↓ 拿到 function 7 关联的所有 group 名列表
+    //   STM32 驱动中每个 function 的 group 列表是 build_state 时建的
+    //   function 7(af6)：groups = {"PA4", "PA5", ...} 这类 pin 名
     ret = pmxops->get_function_groups(pctldev, setting->data.mux.func,
                       &groups, &num_groups);
     if (ret < 0) return ret;
@@ -1351,7 +1472,8 @@ int pinmux_map_to_setting(const struct pinctrl_map *map,
         return -EINVAL;
     }
 
-    // ③ 在 groups[] 中按名匹配 map 中的 group
+    // ↓ 在 groups[] 中找 "PA4" 的索引（用于后续校验）
+    //   match_string 遍历 groups[] 比对字符串，返回 "PA4" 在数组中的位置
     if (map->data.mux.group) {
         group = map->data.mux.group;         // → "PA4"
         ret = match_string(groups, num_groups, group);
@@ -1365,7 +1487,9 @@ int pinmux_map_to_setting(const struct pinctrl_map *map,
         group = groups[0];
     }
 
-    // ④ group 名 → 整数选择器
+    // ↓ 把 group 字符串 "PA4" 转成整数 4
+    //   内部遍历 pinctrl_dev->desc->pins[] 按 name 匹配
+    //   找到 pin_desc.name == "PA4" 的条目，返回其索引
     ret = pinctrl_get_group_selector(pctldev, group);
     if (ret < 0) {
         dev_err(pctldev->dev, "invalid group %s in map table\n",
@@ -1651,7 +1775,10 @@ int pinmux_enable_setting(const struct pinctrl_setting *setting)
 #### pin_request — 冲突检测
 
 ```c
-// drivers/pinctrl/pinmux.c:113
+// gpio_range 只是一个类型标记，不是查表结果：
+//   NULL  → mux 请求（场景一 USART2），检查/设置 desc->mux_owner
+//   非空 → GPIO 请求（场景二 GPIOH5），检查/设置 desc->gpio_owner
+// 同一 pin 不能同时被两种模式占用
 static int pin_request(struct pinctrl_dev *pctldev,
                int pin, const char *owner,
                struct pinctrl_gpio_range *gpio_range)
@@ -1743,23 +1870,34 @@ static int stm32_pmx_set_mux(struct pinctrl_dev *pctldev,
     if (function == STM32_PIN_RSVD)
         return 0;
 
-    // ③ 通过 gpio range 找到对应的 GPIO bank
+    // ↓ ③ pinctrl pin 号(4) → GPIO bank 映射（跨子系统查找）
+    //   pinctrl_find_gpio_range_from_pin 遍历 pctldev->gpio_ranges 链表，
+    //   找哪个 GPIO range 包含了 pinctrl pin 4。
+    //   对 PA4：GPIOA 的 range->pin_base=0, npins=16，4 在 [0,15] 范围内 → 匹配
+    //   返回的 range->gc 是 GPIOA 的 gpio_chip，
+    //   gpiochip_get_data(range->gc) 得到 stm32_gpio_bank，bank->base = 0x44240000
     range = pinctrl_find_gpio_range_from_pin(pctldev, g->pin);
     if (!range)
         return -EINVAL;
     bank = gpiochip_get_data(range->gc);
 
-    pin = stm32_gpio_pin(g->pin);       // g->pin % 16 = 4
+    // ↓ ④ pinctrl pin 号(4) → GPIO bank 内偏移(4)
+    //   stm32_gpio_pin(g->pin) = g->pin % 16 = 4 % 16 = 4
+    //   这是写寄存器时需要的位域偏移——MODER bits[9:8], AFRL bits[19:16]
+    pin = stm32_gpio_pin(g->pin);
 
-    // ④ 将 function selector 转为 mode 和 alt 值
-    // function=7: stm32_gpio_functions[7]="af6"
-    mode = stm32_gpio_get_mode(function);   // 7 ∈ [1,16] → 2 (AF模式)
-    alt  = stm32_gpio_get_alt(function);    // 7 → 7-1=6 (硬件AF6值)
+    // ↓ ⑤ function selector(7) → mode(2) + alt(6)
+    //   stm32_gpio_get_mode(7)  → 7 ∈ [1,16] → 返回 2 (AF 模式)
+    //   stm32_gpio_get_alt(7)   → 7-1 → 返回 6 (硬件 AF6 值)
+    mode = stm32_gpio_get_mode(function);
+    alt  = stm32_gpio_get_alt(function);
 
-    // ⑤ 写入寄存器
+    // ↓ ⑥ 写寄存器：先写 AFRL（选 AF6），再写 MODER（切到 AF 模式）
     return stm32_pmx_set_mode(bank, pin, mode, alt);
 }
 ```
+
+> **两个子系统的 pin 映射**：pinctrl 层（`g->pin=4`）和 GPIO 层（`bank->base + offset=4`）是两套编号。`pinctrl_find_gpio_range_from_pin` 通过 probe 时建立的 `pinctrl_gpio_range` 链表，把 pinctrl pin 号翻译到 GPIO chip + bank 结构体；`stm32_gpio_pin` 算出 bank 内的位偏移。两者加起来才能定位到具体的硬件寄存器位域。
 
 #### stm32_pmx_set_mode — 最终写寄存器
 
@@ -2027,6 +2165,94 @@ pins2 {                          /* PA8 */
 ```
 PUPDR (@ 0x4424000C):
   bits 17:16 = 0b01 → pull-up (bias-pull-up)
+```
+
+**pinconf_apply_setting 源码分析**（pinconf.c:148）
+
+这是 pinctrl core 层的通用分发函数——根据 setting 类型调驱动回调，看不到硬件细节：
+
+```c
+int pinconf_apply_setting(const struct pinctrl_setting *setting)
+{
+    struct pinctrl_dev *pctldev = setting->pctldev;
+    const struct pinconf_ops *ops = pctldev->desc->confops;
+
+    // STM32 驱动注册了 confops，不会走这里
+    if (!ops) { dev_err(...); return -EINVAL; }
+
+    switch (setting->type) {
+    case PIN_MAP_TYPE_CONFIGS_GROUP:      // USART2 走这分支
+        ret = ops->pin_config_group_set(pctldev,
+                setting->data.configs.group_or_pin,   // group_sel=4 (PA4)
+                setting->data.configs.configs,        // {bias-disable, drive-push-pull, slew-rate=0}
+                setting->data.configs.num_configs);   // 3
+        break;
+    }
+    return ret;
+}
+```
+
+**stm32_pconf_group_set**（pinctrl-stm32.c:1539） 和 **stm32_pconf_set**（pinctrl-stm32.c:1561）
+
+`ops->pin_config_group_set` 对应 STM32 驱动的 `stm32_pconf_group_set`，它遍历 group 内的每个 pin 调 `stm32_pconf_parse_conf`。因为 STM32 一 pin 一 group，每次只处理一个 pin。`stm32_pconf_set` 是单 pin 版本，逻辑相同：
+
+```c
+// stm32_pconf_set：遍历 3 个 pinconf 配置，逐个解析+写寄存器
+static int stm32_pconf_set(struct pinctrl_dev *pctldev, unsigned int pin,
+               unsigned long *configs, unsigned int num_configs)
+{
+    int i, ret;
+
+    for (i = 0; i < num_configs; i++) {
+        // pinconf_to_config_param 取配置类型（如 BIAS_DISABLE）
+        // pinconf_to_config_argument 取参数值（如 slew-rate 的数值）
+        ret = stm32_pconf_parse_conf(pctldev, pin,
+                pinconf_to_config_param(configs[i]),
+                pinconf_to_config_argument(configs[i]));
+        if (ret < 0)
+            return ret;
+    }
+    return 0;
+}
+```
+
+对 PA4，循环 3 次：
+```
+i=0: param=BIAS_DISABLE, arg=0      → stm32_pconf_set_bias → PUPDR bits[9:8]=00
+i=1: param=DRIVE_PUSH_PULL, arg=0   → stm32_pconf_set_driving → OTYPER bit4=0
+i=2: param=SLEW_RATE, arg=0         → stm32_pconf_set_speed → OSPEEDR bits[9:8]=00
+```
+
+**stm32_pconf_parse_conf**（pinctrl-stm32.c:1456）
+
+这是真正的寄存器操作分发器——根据 param 类型调对应的写寄存器函数：
+
+```c
+static int stm32_pconf_parse_conf(struct pinctrl_dev *pctldev,
+        unsigned int pin, enum pin_config_param param,
+        enum pin_config_param arg)
+{
+    // 从 pinctrl pin 号找到 GPIO bank + 偏移（和 stm32_pmx_set_mux 中的查找一样）
+    range = pinctrl_find_gpio_range_from_pin_nolock(pctldev, pin);
+    bank = gpiochip_get_data(range->gc);
+    offset = stm32_gpio_pin(pin);    // pinctrl pin 号 → bank 内偏移
+
+    switch (param) {
+    case PIN_CONFIG_BIAS_DISABLE:
+        ret = stm32_pconf_set_bias(bank, offset, 0);  // PUPDR[9:8] = 00
+        break;
+    case PIN_CONFIG_BIAS_PULL_UP:
+        ret = stm32_pconf_set_bias(bank, offset, 1);  // PUPDR[17:16] = 01
+        break;
+    case PIN_CONFIG_DRIVE_PUSH_PULL:
+        ret = stm32_pconf_set_driving(bank, offset, 0); // OTYPER[4] = 0
+        break;
+    case PIN_CONFIG_SLEW_RATE:
+        ret = stm32_pconf_set_speed(bank, offset, arg);  // OSPEEDR[9:8] = arg
+        break;
+    // 还有 BIAS_PULL_DOWN、DRIVE_OPEN_DRAIN 等
+    }
+}
 ```
 
 ### 4.2.9 ATK 板实例完全验证
