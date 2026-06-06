@@ -2401,6 +2401,17 @@ gpioset gpiochip7 5=1
 
 ### 4.3.3 路径全貌
 
+下面是场景二中关键函数的分组介绍，在后续各节逐个展开：
+
+| 分组 | 函数 | 做什么 |
+|------|------|--------|
+| **字符设备** | `gpio_chrdev_open` | open `/dev/gpiochipN`，分配 chardev 数据 |
+| **请求 line** | `linereq_create` | 处理 `GPIO_V2_GET_LINE_IOCTL`，创建匿名 fd |
+| **GPIO 申请** | `gpiod_request_user` → `stm32_gpio_request` | gpiolib 标记 + 通知 pinctrl 冲突检测 |
+| **方向配置** | `gpiod_direction_output/input` | 写 BSRR 设初始电平，写 MODER 切模式 |
+| **读写电平** | `stm32_gpio_set` / `stm32_gpio_get` | 写 BSRR（原子操作）/ 读 IDR |
+| **中断** | `edge_detector_setup` → `stm32_gpio_to_irq` | 注册线程化中断，GPIO→EXTI→GIC |
+
 ```
 用户态 (gpioset/gpioget/gpiomon 或自定义程序)
   │
@@ -2501,6 +2512,37 @@ crw------- 1 root root 254, 7 Jan 1  1970 /dev/gpiochip7   ← GPIOH
 
 ### 4.3.5 open("/dev/gpiochipN") — 初始化 chardev 数据
 
+`gpio_chrdev_open` 是 `gpio_fileops` 中的 `.open` 回调，用户 `open("/dev/gpiochip7", ...)` 时被 VFS 层自动调用。它分配 `struct gpio_chardev_data` 作为后续 ioctl 的数据容器。
+
+结构体定义（`gpiolib-cdev.c:2535`）：
+
+```c
+struct gpio_chardev_data {
+    struct gpio_device *gdev;
+    wait_queue_head_t wait;
+    DECLARE_KFIFO(events, struct gpio_v2_line_info_changed, 32);
+    struct notifier_block lineinfo_changed_nb;
+    struct notifier_block device_unregistered_nb;
+    unsigned long *watched_lines;
+};
+```
+
+各字段在实际场景中的用途：
+
+**`gdev`** — 指向这个 `/dev/gpiochipN` 对应的 GPIO 设备。比如 `open("/dev/gpiochip7")` 时，`inode->i_cdev` 反推出 `gdev = GPIOH`。通过 `gdev->chip` 拿到 `gpio_chip`（内含 `.set`/`.get`/`.request` 回调），通过 `gdev->chip->parent` 找到 STM32 驱动私有数据 `stm32_gpio_bank`，拿到寄存器基址 `0x442b0000`。
+
+用户后续所有 ioctl 操作（请求 line、读写电平）最终都是通过这个指针找到具体硬件的。
+
+**`wait`** — 等待队列。当用户程序用 `poll()` 监听 GPIO 边沿事件时（如 `gpiomon`），内核将进程挂在这个等待队列上。硬件中断触发后，`edge_irq_handler` 把事件写入 kfifo，然后 `wake_up` 这个队列，`poll()` 返回可读，用户 `read()` 取走事件。
+
+**`events`** — kfifo（内核 FIFO），存边沿检测事件。声明 `[32]` 表示最多缓存 32 个事件。当 `gpiomon gpiochip6 5 -r -f` 监听 GPIOG5 时，每次引脚跳变产生一个 `struct gpio_v2_line_info_changed`，写入这个 FIFO。如果用户来不及读，FIFO 满了之后新事件会被丢弃。
+
+**`lineinfo_changed_nb`** — 通知链回调。注册到 `gdev->line_state_notifier`。当 GPIO line 状态变更时（比如某个程序用 `gpioset` 占用了 line 5，或者释放了 line），内核会遍历这个通知链，调用已注册的 `lineinfo_changed_notify`。最终效果是：如果你正在用 `gpiomon --watch` 监控 line 状态，设备被其他程序占用时会收到通知。
+
+**`device_unregistered_nb`** — 设备移除通知。如果 GPIO chip 被热拔（实际嵌入式设备很少发生），内核会通知所有打开这个 chardev 的进程。通知后后续 ioctl 返回 `-ENODEV`。
+
+**`watched_lines`** — bitmap，记录哪些 line 被 `GPIO_V2_GET_LINEINFO_WATCH_IOCTL` 监控了。比如用户执行 `gpiomon --watch gpiochip0 3`，内核内部调 `lineinfo_get(..., watch=true)`，就会在 `watched_lines` 中置 bit 3。之后 line 3 的状态变更时，通过 `watched_lines` 筛选，只通知关心这条 line 的进程，不打扰其他程序。
+
 ```c
 // drivers/gpio/gpiolib-cdev.c:2881
 static int gpio_chrdev_open(struct inode *inode, struct file *file)
@@ -2548,7 +2590,17 @@ file  (用户态 fd)
 用户调用 `ioctl(fd, GPIO_V2_GET_LINE_IOCTL, &req)` 时，内核 VFS 层调用 `gpio_fileops.unlocked_ioctl`，即 `gpio_ioctl`。
 
 ```c
-// drivers/gpio/gpiolib-cdev.c:2705
+// gpio_ioctl：VFS 层调用的 ioctl 入口
+// file  — 用户 open 返回的 fd 对应的内核 file 结构体
+//         file->private_data 指向 gpio_chardev_data（由 gpio_chrdev_open 赋值）
+// cmd   — 用户态传入的 ioctl 命令码，如 GPIO_V2_GET_LINE_IOCTL
+// arg   — 用户态传入的参数指针，转为 void __user *ip 后传给下层
+//
+// 例如 gpioset gpiochip7 5=1 内部调用 ioctl(fd, GPIO_V2_GET_LINE_IOCTL, &req)
+// 时：file 对应 /dev/gpiochip7 的 fd，cmd = GPIO_V2_GET_LINE_IOCTL，
+// arg = 用户空间 &req 的地址
+//
+// call_ioctl_locked 加锁后调 gpio_ioctl_unlocked，防止并发 ioctl 竞态
 static long gpio_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     struct gpio_chardev_data *cdev = file->private_data;
@@ -2556,26 +2608,56 @@ static long gpio_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                   gpio_ioctl_unlocked);
 }
 
+// gpio_ioctl_unlocked：实际的 ioctl 分发函数
 static long gpio_ioctl_unlocked(struct file *file, unsigned int cmd,
                  unsigned long arg)
 {
     struct gpio_chardev_data *cdev = file->private_data;
+    // gdev 指向这个 chardev 对应的 GPIO 设备
+    // 比如 /dev/gpiochip7 → gdev = GPIOH, /dev/gpiochip0 → gdev = GPIOA
     struct gpio_device *gdev = cdev->gdev;
+    // ip 是用户态参数指针的内核表示（__user 标记，需要用 copy_from_user 读取）
+    // 如 gpioset 传了 struct gpio_v2_line_request，ip 指向用户空间的这个结构体
     void __user *ip = (void __user *)arg;
 
+    // chip 被移除时返回 -ENODEV（正常不会发生）
     if (!gdev->chip) return -ENODEV;
 
     switch (cmd) {
+    // GPIO_GET_CHIPINFO_IOCTL：读取 chip 基本信息（名称、label、引脚数）
+    // 用户执行 gpiodetect 或 gpioinfo 时触发
+    // 返回数据包含 chip 名 "gpiochip7"、label "GPIOH"、ngpios=12
     case GPIO_GET_CHIPINFO_IOCTL:
         return chipinfo_get(cdev, ip);
+
+    // GPIO_V2_GET_LINEINFO_IOCTL：读取某条 line 的信息
+    // 用户传 struct gpio_v2_line_info { offset=5, ... }
+    // 返回该 line 的方向、是否被占用、consumer 名等
     case GPIO_V2_GET_LINEINFO_IOCTL:
         return lineinfo_get(cdev, ip, false);
+
+    // GPIO_V2_GET_LINEINFO_WATCH_IOCTL：同 GET_LINEINFO，但额外注册 watch
+    // 第三个参数 true——之后这条 line 的状态变更会通过 events FIFO 通知
+    // gpiomon --watch gpiochip0 3 内部调此 ioctl 来监控 line 3 的占用变化
     case GPIO_V2_GET_LINEINFO_WATCH_IOCTL:
         return lineinfo_get(cdev, ip, true);
+
+    // GPIO_V2_GET_LINE_IOCTL：★ 核心 — 请求 GPIO line，创建 line request
+    // gpioset/gpioget/gpiomon 都通过这个 ioctl 获得 GPIO 访问权限
+    // 如 gpioset gpiochip7 5=1 构造的请求：
+    //   req.offsets[0]=5, req.consumer="gpioset", req.config.flags=OUTPUT
+    // 内核返回一个匿名 fd，后续通过这个 fd 读写电平或注册中断
+    //
+    // 注意：SET_VALUES / GET_VALUES 不在这个 switch 中——
+    // 它们走的是 linereq_create 返回的匿名 fd 的 ioctl 处理函数，
+    // 即 linereq_set_values / linereq_get_values（见下节 4.3.8/4.3.9）
     case GPIO_V2_GET_LINE_IOCTL:
-        return linereq_create(gdev, ip);              // ★ 请求 GPIO line
+        return linereq_create(gdev, ip);
+
+    // 取消 watch 监听，清除 watched_lines bitmap 中对应位
     case GPIO_GET_LINEINFO_UNWATCH_IOCTL:
         return lineinfo_unwatch(cdev, ip);
+
     default:
         return -EINVAL;
     }
@@ -2586,14 +2668,130 @@ static long gpio_ioctl_unlocked(struct file *file, unsigned int cmd,
 
 这是用户态获取 GPIO 访问权限的核心函数。libgpiod 的 `gpioset`/`gpioget`/`gpiomon` 都通过这个 ioctl 请求 GPIO。
 
+它内部创建一个**匿名 fd**，对应一组由 `offsets[]` 指定的 GPIO line（数量由 `num_lines` 决定）。这个 fd 的 `file_operations` 是 `line_fileops`（`linereq_ioctl`、`linereq_read`、`linereq_poll`、`linereq_release`）。**后续 SET_VALUES/GET_VALUES ioctl 走的是 `linereq_ioctl`**，不再经过 `gpio_ioctl_unlocked`。
+
+`linereq` 结构体（`gpiolib-cdev.c:595`）：
+
+```c
+struct linereq {
+    struct gpio_device *gdev;     // GPIO 设备（如 GPIOH）
+    const char *label;            // 消费者名（"gpioset"）
+    u32 num_lines;                // line 数
+    wait_queue_head_t wait;       // poll 等待边沿事件用
+    struct notifier_block device_unregistered_nb;
+    u32 event_buffer_size;        // 事件缓冲区大小
+    DECLARE_KFIFO_PTR(events, struct gpio_v2_line_event);  // 边沿事件 FIFO
+    atomic_t seqno;               // 事件序号
+    struct mutex config_mutex;
+    struct line lines[];          // 柔性数组，每 line 一个条目
+};
+```
+
+各字段用途：
+- **`gdev`**：指向 GPIOH。后续 `set_value` 时通过 `gdev->chip` 找到 `stm32_gpio_bank` 和寄存器基址
+- **`label`**：`"gpioset"`，会写入 `gpio_desc->label`，`cat /sys/kernel/debug/gpio` 能看到谁占用了 line
+- **`wait` + `events`**：gpiomon 用。边沿触发时中断 handler 写事件到 FIFO 然后 `wake_up`，`poll()` 返回可读
+- **`lines[]`**：每个 `struct line` 内有 `desc` 指针（指向 `gpio_desc`）和 `edflags`（边沿触发方式）
+
+匿名 fd 关联的 file_operations（`gpiolib-cdev.c:1797`）：
+
+```c
+static const struct file_operations line_fileops = {
+    .release = linereq_release,    // close fd → 释放这个 linereq 的所有 GPIO line
+    .read    = linereq_read,       // read → 读取边沿事件（gpiomon 用）
+    .poll    = linereq_poll,       // poll → 等待边沿事件就绪
+    .owner   = THIS_MODULE,
+    .llseek  = noop_llseek,
+    .unlocked_ioctl = linereq_ioctl,  // ioctl → SET_VALUES/GET_VALUES 等
+};
+```
+
+**四个回调函数的源码分析**
+
+**① `linereq_ioctl`** — SET_VALUES/GET_VALUES 分发（gpiolib-cdev.c:1642/1621）
+
+```c
+// gpioset 后续调 ioctl(line_fd, GPIO_V2_LINE_SET_VALUES_IOCTL, &vals) 时进入
+// file->private_data 指向 linereq（anon_inode_getfile 时设置的）
+// cmd = GPIO_V2_LINE_SET_VALUES_IOCTL,
+// ip 指向用户空间 struct gpio_v2_line_values {mask=BIT(0), bits=BIT(0)}
+static long linereq_ioctl_unlocked(struct file *file, unsigned int cmd,
+                   unsigned long arg)
+{
+    struct linereq *lr = file->private_data;
+    void __user *ip = (void __user *)arg;
+    if (!lr->gdev->chip) return -ENODEV;
+    switch (cmd) {
+    case GPIO_V2_LINE_GET_VALUES_IOCTL:
+        return linereq_get_values(lr, ip);     // 读电平 -> IDR
+    case GPIO_V2_LINE_SET_VALUES_IOCTL:
+        return linereq_set_values(lr, ip);     // 写电平 -> BSRR
+    case GPIO_V2_LINE_SET_CONFIG_IOCTL:
+        return linereq_set_config(lr, ip);     // 改配置
+    default:
+        return -EINVAL;
+    }
+}
+```
+
+**② `linereq_poll`** — poll 等待边沿事件（gpiolib-cdev.c:1677/1659）
+
+```c
+// gpiomon 调 poll(line_fd, POLLIN) 等待 GPIO 电平跳变
+static __poll_t linereq_poll_unlocked(struct file *file,
+                      struct poll_table_struct *wait)
+{
+    struct linereq *lr = file->private_data;
+    poll_wait(file, &lr->wait, wait);  // 进程挂到等待队列上
+    if (!kfifo_is_empty_spinlocked_noirqsave(&lr->events, &lr->wait.lock))
+        events = EPOLLIN | EPOLLRDNORM;  // FIFO 有数据 -> 可读
+    return events;
+}
+```
+
+**③ `linereq_read`** — 从 FIFO 读边沿事件（gpiolib-cdev.c:1740/1685）
+
+```c
+// gpiomon 在 poll 返回 POLLIN 后调 read() 读事件
+static ssize_t linereq_read_unlocked(struct file *file, char __user *buf,
+                     size_t count, loff_t *f_ps)
+{
+    struct linereq *lr = file->private_data;
+    do {
+        spin_lock(&lr->wait.lock);
+        if (kfifo_is_empty(&lr->events))
+            wait_event_interruptible_locked(lr->wait,
+                    !kfifo_is_empty(&lr->events));  // 阻塞等事件
+        kfifo_out(&lr->events, &le, 1);               // 取一个事件
+        spin_unlock(&lr->wait.lock);
+        copy_to_user(buf + bytes_read, &le, sizeof(le));
+        bytes_read += sizeof(le);
+    } while (count >= bytes_read + sizeof(le));
+    return bytes_read;
+}
+```
+
+事件包含：序号、时间戳、offset、触发方式。gpiomon 打印的 `"     5     1    rising"` 从这里解析。
+
+**④ `linereq_release`** — close fd 释放资源（gpiolib-cdev.c:1774）
+
+```c
+static int linereq_release(struct inode *inode, struct file *file)
+{
+    struct linereq *lr = file->private_data;
+    linereq_free(lr);   // 释放 linereq 及所有 GPIO line
+    return 0;
+}
+```
+
 **用户执行 `gpioset gpiochip7 5=1` 时，libgpiod 构造的 ioctl 参数：**
 
 ```c
 struct gpio_v2_line_request req = {
-    .offsets     = { 5, 0, 0, 0, ... },    // ← GPIOH bank 内偏移 5
-    .consumer    = "gpioset",               // ← 消费者名称
+    .offsets     = { 5, 0, 0, 0, ... },    // GPIOH bank 内偏移 5
+    .consumer    = "gpioset",               // 消费者名
     .config = {
-        .flags  = GPIO_V2_LINE_FLAG_OUTPUT, // ← 输出方向
+        .flags  = GPIO_V2_LINE_FLAG_OUTPUT, // 输出方向
     },
     .num_lines = 1,
 };
@@ -2604,52 +2802,100 @@ struct gpio_v2_line_request req = {
 ```c
 static int linereq_create(struct gpio_device *gdev, void __user *ip)
 {
+    // gdev = GPIOH（/dev/gpiochip7 对应的设备）
+    // ip   = 用户空间 &req 的地址
     struct gpio_v2_line_request ulr;
+    struct gpio_v2_line_config *lc;
     struct linereq *lr;
-    int fd, ret;
+    struct file *file;
+    u64 flags, edflags;
     unsigned int i;
+    int fd, ret;
 
-    // ① 从用户态复制请求参数
+    // ↓ ① copy_from_user：从用户空间复制请求
+    //    成功后 ulr.offsets[0]=5, ulr.consumer="gpioset",
+    //    ulr.num_lines=1, ulr.config.flags=OUTPUT
     if (copy_from_user(&ulr, ip, sizeof(ulr)))
         return -EFAULT;
-    // ulr.offsets[0]=5, ulr.consumer="gpioset", ulr.num_lines=1
 
-    // ② 参数验证
+    // ↓ ② 参数验证
+    //    num_lines 不能为 0/超限，padding 必须为 0，config flags 必须合法
     if ((ulr.num_lines == 0) || (ulr.num_lines > GPIO_V2_LINES_MAX))
         return -EINVAL;
+    lc = &ulr.config;
+    ret = gpio_v2_line_config_validate(lc, ulr.num_lines);
+    if (ret) return ret;
 
-    // ③ 分配 linereq 结构体
+    // ↓ ③ 分配 linereq 结构体 + 柔性数组 lines[1]
+    //    struct_size(lr, lines, 1) = sizeof(linereq) + 1 * sizeof(struct line)
     lr = kzalloc(struct_size(lr, lines, ulr.num_lines), GFP_KERNEL);
+    if (!lr) return -ENOMEM;
     lr->gdev = gpio_device_get(gdev);
-    lr->num_lines = 1;
 
-    if (ulr.consumer[0] != '\0') {
-        lr->label = kstrndup("gpioset", ...);
+    // 初始化 line 条目
+    for (i = 0; i < ulr.num_lines; i++) {
+        lr->lines[i].req = lr;
+        INIT_DELAYED_WORK(&lr->lines[i].work, debounce_work_func);
     }
+
+    // 拷贝 consumer 名
+    if (ulr.consumer[0] != '\0')
+        lr->label = kstrndup(ulr.consumer, sizeof(ulr.consumer) - 1, GFP_KERNEL);
+
+    // 初始化队列/FIFO/序号
+    init_waitqueue_head(&lr->wait);
+    lr->num_lines = ulr.num_lines;
 
     // ═══ ④ 逐个 line 请求 GPIO ═══
+    //    gpioset gpiochip7 5=1 只请求 1 个 line，循环 1 次
     for (i = 0; i < ulr.num_lines; i++) {
-        u32 offset = ulr.offsets[i];              // → 5 (GPIOH5)
+        u32 offset = ulr.offsets[i];         // → 5 (GPIOH5)
 
-        desc = gpiochip_get_desc(gdev->chip, 5);
-        // → desc = &gdev->descs[5]
+        // gdev->chip->descs[5] → 找到 GPIOH5 的 gpio_desc
+        desc = gpiochip_get_desc(gdev->chip, offset);
+        if (IS_ERR(desc)) goto out_free_linereq;
 
-        ret = gpiod_request_user(desc, "gpioset");
+        // ↓ gpiod_request_user → gpiod_request_commit
+        //   标记 FLAG_REQUESTED，设 label="gpioset"
+        //   然后 stm32_gpio_request → pinctrl_gpio_request → pin_request
+        //   做冲突检测，设 desc->gpio_owner
+        ret = gpiod_request_user(desc, lr->label);
         if (ret) goto out_free_linereq;
-
         lr->lines[i].desc = desc;
 
-        // 配置 flags 和方向
-        flags = gpio_v2_line_config_flags(&ulr.config, 0);  // OUTPUT
+        // 解析 flags（OUTPUT/INPUT/EDGE 等）
+        flags = gpio_v2_line_config_flags(lc, i);   // → OUTPUT
+        gpio_v2_line_config_flags_to_desc_flags(flags, &desc->flags);
+
         if (flags & GPIO_V2_LINE_FLAG_OUTPUT) {
-            int val = gpio_v2_line_config_output_value(&ulr.config, 0);
-            // → val = 1 (gpioset 5=1)
-            ret = gpiod_direction_output(desc, 1);
+            // gpioset gpiochip7 5=1 走这里
+            // gpiod_direction_output(desc, val=1) 内部:
+            //   ① __stm32_gpio_set() 写 BSRR 设初始电平
+            //   ② stm32_pmx_gpio_set_direction() 写 MODER 切输出
+            int val = gpio_v2_line_config_output_value(lc, i);
+            ret = gpiod_direction_output(desc, val);
+            if (ret) goto out_free_linereq;
+        } else if (flags & GPIO_V2_LINE_FLAG_INPUT) {
+            // gpiomon/gpioget 走这里：设方向 + 配置边沿检测
+            ret = gpiod_direction_input(desc);
+            if (ret) goto out_free_linereq;
+            ret = edge_detector_setup(&lr->lines[i], lc, i, edflags);
+            if (ret) goto out_free_linereq;
         }
+        lr->lines[i].edflags = edflags;
     }
 
-    // ⑤ 分配匿名 fd 返回用户态
+    // ↓ ⑤ 分配匿名 fd，关联它对应的 file_operations
+    //    这个 fd 对应一组由 offsets[] 指定的 GPIO line（本例只有一个 offset=5）
+    //    和 chip fd (/dev/gpiochip7) 不是同一个——它的 ioctl handler 是
+    //    linereq_ioctl（处理 SET_VALUES/GET_VALUES），poll/read 用于读取边沿事件
     fd = get_unused_fd_flags(O_RDONLY | O_CLOEXEC);
+    if (fd < 0) goto out_free_linereq;
+
+    file = anon_inode_getfile("gpio-line", &line_fileops, lr,
+                  O_RDONLY | O_CLOEXEC);
+    if (IS_ERR(file)) goto out_put_unused_fd;
+
     fd_install(fd, file);
     return fd;
 }
@@ -2657,45 +2903,76 @@ static int linereq_create(struct gpio_device *gdev, void __user *ip)
 
 #### gpiod_request_user → gpiod_request → gpiod_request_commit
 
-`gpiod_request_user` 内部调 `gpiod_request`，`gpiod_request` 调 `gpiod_request_commit`：
+`linereq_create` 内部调用了 `gpiod_request_user(desc, lr->label)`，这里展开看它如何一步步把 GPIOH5 标记为"已被请求"。
+
+**`gpiod_request`**（gpiolib.c:2181）
 
 ```c
-// gpiolib.c:2181
+// desc  — GPIOH5 的 gpio_desc（gpiochip_get_desc(gdev->chip, 5) 返回的）
+// label — "gpioset"（用户传进来的 consumer 名）
 int gpiod_request(struct gpio_desc *desc, const char *label)
 {
     int ret = -EPROBE_DEFER;
 
+    // try_module_get：防止 GPIO 驱动模块被卸载
+    // desc->gdev->owner 是 GPIOH 驱动的 THIS_MODULE
+    // 如果驱动正在被卸载，try_module_get 返回 false，返回 -EPROBE_DEFER
     if (try_module_get(desc->gdev->owner)) {
-        ret = gpiod_request_commit(desc, "gpioset");
+        ret = gpiod_request_commit(desc, label);
         if (ret)
-            module_put(desc->gdev->owner);
+            module_put(desc->gdev->owner);  // 失败释放模块引用
         else
-            gpio_device_get(desc->gdev);
+            gpio_device_get(desc->gdev);    // 成功引用计数+1
     }
     return ret;
 }
+```
 
+**`gpiod_request_commit`**（gpiolib.c:2207）
+
+```c
 static int gpiod_request_commit(struct gpio_desc *desc, const char *label)
 {
     struct gpio_chip *gc = desc->gdev->chip;
     unsigned offset;
 
-    // ① 标记为已请求（防止重复请求）
+    // ↓ ① test_and_set_bit(FLAG_REQUESTED, &desc->flags)
+    //    检查 GPIOH5 的 desc->flags 中 FLAG_REQUESTED 位
+    //    第一次：该位=0 → set_bit 设为 1 → 进入 if → 设 label
+    //    第二次：该位=1 → 返回 1 → else → return -EBUSY
+    //    这就是"引脚已被占用"的检查
     if (test_and_set_bit(FLAG_REQUESTED, &desc->flags) == 0) {
-        desc_set_label(desc, "gpioset");
+        desc_set_label(desc, label);   // desc->label = "gpioset"
     } else {
-        return -EBUSY;          // GPIOH5 已被其他程序占用
+        return -EBUSY;
     }
 
-    // ② 调 chip 驱动的 .request 回调
+    // ↓ ② 调 chip 驱动的 .request 回调
+    //    gc = GPIOH 的 gpio_chip，gc->request = stm32_gpio_request
     if (gc->request) {
-        offset = gpio_chip_hwgpio(desc);      // offset = 5
-        ret = gc->request(gc, 5);
+        offset = gpio_chip_hwgpio(desc);   // → 5
+        ret = gc->request(gc, offset);
         // → stm32_gpio_request(GPIOH_chip, 5)
+        //   内部算 pinctrl pin# = 5 + 7*16 = 117
+        //   pinctrl_gpio_request → pin_request → 冲突检测
+        //   设 pin_desc[119].gpio_owner = "gpioh:117"
     }
 
     return 0;
 }
+```
+
+**执行后状态变化：**
+
+```
+执行前:
+  desc->flags = 0
+  desc->label = NULL
+
+执行后:
+  desc->flags |= FLAG_REQUESTED    （已请求标记）
+  desc->label = "gpioset"
+  pin_desc[119].gpio_owner = "gpioh:117"  （pinctrl 层冲突标记）
 ```
 
 **GPIOH5 从用户 `gpioset gpiochip7 5=1` 到 `gpiod_request_commit` 的数据流：**
@@ -2964,67 +3241,93 @@ writel_relaxed(BIT(21), 0x442b0000 + 0x18)
 
 ### 4.3.9 读 GPIO：从 ioctl 到 IDR 寄存器
 
+用户执行 `gpioget gpiochip7 5` 时，libgpiod 在 line fd 上调 `ioctl(GPIO_V2_LINE_GET_VALUES_IOCTL, &vals)`。调用链如下：
+
+```
+用户态: ioctl(line_fd, GPIO_V2_LINE_GET_VALUES_IOCTL, &vals)
+  │
+  │  linereq_ioctl → linereq_ioctl_unlocked
+  │  case GPIO_V2_LINE_GET_VALUES_IOCTL
+  ▼
+  linereq_get_values(lr, ip)           [gpiolib-cdev.c]
+    │  解析 mask（GPIOH5 的 gpio_desc）
+    │
+    ▼
+    gpiod_get_array_value_complex()    [gpiolib.c]
+      │
+      └─ gpiod_get_raw_value_commit(desc)
+           │
+           ▼
+           gpio_chip_get_value(gc, desc)  [gpiolib.c]
+             │  gc = GPIOH 的 gpio_chip
+             │  gc->get = stm32_gpio_get
+             │  gpio_chip_hwgpio(desc) → offset = 5
+             │
+             ▼
+             stm32_gpio_get(chip, 5)      [pinctrl-stm32.c]
+               │  bank->base = 0x442b0000
+               │  readl(0x442b0000 + 0x10) → IDR
+               │  !!(val & BIT(5)) → 第 5 位电平
+               │
+               └── 返回 1（高）或 0（低）
+```
+
+逐层代码：
+
 ```c
-// gpiolib-cdev.c:1435
+// ① linereq_get_values — 读路径入口
+// 用户调 ioctl(line_fd, GPIO_V2_LINE_GET_VALUES_IOCTL, &vals)
+// ip 指向用户空间 struct gpio_v2_line_values {mask=BIT(0), bits=0}
 static long linereq_get_values(struct linereq *lr, void __user *ip)
 {
-    // ... 解析 mask 参数
+    // 解析 mask，找到需要读取的 gpio_desc
+    // GPIOH5: descs[0] = lr->lines[0].desc
     ret = gpiod_get_array_value_complex(false, true, num_get,
                         descs, NULL, vals);
 }
 
-// gpiolib.c:3635
-int gpiod_get_value_cansleep(const struct gpio_desc *desc)
-{
-    int value;
-    value = gpiod_get_raw_value_commit(desc);
-    if (test_bit(FLAG_ACTIVE_LOW, &desc->flags))
-        value = !value;
-    return value;
-}
-
-// gpiolib.c:2816
+// ② gpiod_get_raw_value_commit — gpiolib 获取原始电平
+// 不关心 ACTIVE_LOW，只返回物理电平 0 或 1
 static int gpiod_get_raw_value_commit(const struct gpio_desc *desc)
 {
+    gc = desc->gdev->chip;          // GPIOH 的 gpio_chip
     value = gpio_chip_get_value(gc, desc);
     return value < 0 ? value : !!value;
 }
 
-// gpiolib.c:2789
+// ③ gpio_chip_get_value — 调 chip 驱动的 .get 回调
 static int gpio_chip_get_value(struct gpio_chip *gc, const struct gpio_desc *desc)
 {
-    return gc->get ? gc->get(gc, gpio_chip_hwgpio(desc)) : -EIO;
-    // → stm32_gpio_get(chip, offset)
+    return gc->get(gc, gpio_chip_hwgpio(desc));  // offset=5
+    // → stm32_gpio_get(GPIOH_chip, 5)
 }
-```
 
-#### stm32_gpio_get — 读 IDR
-
-```c
-// pinctrl-stm32.c:392
+// ④ stm32_gpio_get — STM32 驱动读 IDR
 static int stm32_gpio_get(struct gpio_chip *chip, unsigned offset)
 {
     struct stm32_gpio_bank *bank = gpiochip_get_data(chip);
+    // bank->base = 0x442b0000
 
+    // STM32_GPIO_IDR = 0x10
+    // readl(0x442b0000 + 0x10) 读 IDR 全部 16 位
+    // BIT(5) = 0x20，提取第 5 位
     return !!(readl_relaxed(bank->base + STM32_GPIO_IDR) & BIT(offset));
-    // → IDR @ 0x10, 读取 offset 位
 }
 ```
 
-**IDR（Input Data Register）特性：**
+**IDR 特性：**
 
 ```
 IDR 寄存器 (@ 0x10):
-  位 [15:0] = 对应引脚 15~0 的当前输入电平
-  无论引脚配置为什么模式（输入/输出/AF），IDR 都反映引脚的实际物理电平
+  位 [15:0] = 引脚 15~0 的当前输入电平
+  无论引脚是什么模式，IDR 都反映实际物理电平
 ```
 
 **对于 GPIOH5：**
 
 ```c
-val = readl_relaxed(0x442b0000 + 0x10)    // 读取 IDR 所有 16 位
-val & BIT(5)                               // 如果高电平→非0→return 1
-                                           // 如果低电平→0→return 0
+val = readl_relaxed(0x442b0000 + 0x10)  // 读 IDR
+val & BIT(5)                             // 高→1, 低→0
 ```
 
 ### 4.3.10 中断：GPIO → EXTI → GIC（gpiomon 路径）
@@ -3075,49 +3378,107 @@ static int edge_detector_setup(struct line *line,
 
 #### gpiod_to_irq → stm32_gpio_to_irq
 
+`edge_detector_setup` 中通过 `gpiod_to_irq(line->desc)` 获取 GPIO 引脚对应的 Linux IRQ 号。以 `gpiomon gpiochip6 5` 监听 GPIOG5 为例，调用链如下：
+
+```
+  edge_detector_setup(line, lc, line_idx=0, edflags=RISING|FALLING)
+    │
+    └─ gpiod_to_irq(line->desc)          ← GPIOG5 的 gpio_desc
+         │
+         ▼
+         gpiod_to_irq(desc)               [gpiolib.c]
+           │  gc = GPIOG 的 gpio_chip
+           │  gc->to_irq = stm32_gpio_to_irq
+           │  gpio_chip_hwgpio(desc) → offset = 5
+           │
+           ▼
+           stm32_gpio_to_irq(chip=GPIOG, 5)  [pinctrl-stm32.c]
+             │  bank = GPIOG, base = 0x44260000
+             │  第一次：bank->virq[5] == 0 → 未缓存
+             │  之后：直接返回 bank->virq[5]
+             │
+             ▼
+             irq_create_fwspec_mapping(&fwspec)  [irq_domain]
+               │  fwspec.fwnode = GPIOG 的 fwnode
+               │  fwspec.param[0] = 5
+               │  fwspec.param[1] = IRQ_TYPE_NONE
+               │  ① GPIOG bank → EXTI → GIC
+               │  ② 分配 IRQ 号（如 64）
+               │
+               └── 返回 irq = 64，bank->virq[5] = 64
+```
+
+逐层代码（以 GPIOG5 为例）：
+
 ```c
-// gpiolib.c (简化)
+// ① gpiod_to_irq — gpiolib 层，转调 chip 驱动的 to_irq 回调
+// desc = GPIOG5 的 gpio_desc
 int gpiod_to_irq(const struct gpio_desc *desc)
 {
     struct gpio_chip *gc = desc->gdev->chip;
-    return gc->to_irq ? gc->to_irq(gc, gpio_chip_hwgpio(desc)) : -ENXIO;
-    // → stm32_gpio_to_irq(chip, offset)
+    // gpio_chip_hwgpio(desc) → bank 内偏移 = 5
+    return gc->to_irq(gc, 5);
+    // → stm32_gpio_to_irq(GPIOG_chip, offset=5)
 }
-```
 
-```c
-// pinctrl-stm32.c:423
+// ② stm32_gpio_to_irq — STM32 驱动，通过 irq_domain 映射
+// 将 GPIO bank 内偏移转换为 Linux IRQ 号
 static int stm32_gpio_to_irq(struct gpio_chip *chip, unsigned int offset)
 {
     struct stm32_gpio_bank *bank = gpiochip_get_data(chip);
-    struct irq_fwspec fwspec;
 
-    // 如果已缓存，直接返回
+    // 缓存：如果是第二次请求同一个引脚的中断，直接返回之前分配好的 IRQ 号
+    // 比如 gpiomon 退出后再启动，bank->virq[5] 还存着上次的 64
     if (bank->virq[offset])
         return bank->virq[offset];
 
-    // 构造 IRQ fwspec
+    // 构造 irq_fwspec——这是 irq_domain 的"快递单"
+    // fwnode 告诉内核"去哪个 irq_domain 查找"（GPIOG bank 的 domain）
+    // param[0] = offset 告诉 domain"我要映射 bank 内第 5 个引脚"
+    struct irq_fwspec fwspec;
     fwspec.fwnode = bank->gpio_chip.fwnode;
     fwspec.param_count = 2;
-    fwspec.param[0] = offset;
+    fwspec.param[0] = offset;      // → 5
     fwspec.param[1] = IRQ_TYPE_NONE;
 
-    // 通过 irq domain 映射
+    // irq_create_fwspec_mapping 沿着 irq_domain 层次链逐级向上解析：
+    //   GPIOG bank domain → EXTI domain → GIC domain
+    // 每个 domain 的 .translate 或 .xlate 回调解析 param，
+    // 最终 GIC domain 分配一个 CPU 能识别的全局中断号（如 IRQ 64）
     return irq_create_fwspec_mapping(&fwspec);
-    // → bank domain → EXTI domain → GIC domain
 }
+```
+
+**irq_domain 层次结构（03 篇 probe 时建立的）：**
+
+```
+三层 domain，逐级向上解析：
+
+  GPIOG bank irq_domain        （处理 GPIOG 的 16 个 IRQ 映射）
+  ├── .name = "stm32mp257-gpio"
+  ├── 解析：param[0]=5 → EXTI line 5
+  │
+  ▼ 父 domain
+  EXTI irq_domain              （处理 32/64 个 EXTI lines）
+  ├── .name = "stm32-exti"
+  ├── 解析：EXTI line 5 → GIC interrupt 64
+  │
+  ▼ 父 domain
+  GIC irq_domain               （ARM Generic Interrupt Controller）
+  └── 分配 Linux IRQ 号（如 64）
 ```
 
 **中断路径总结：**
 
 ```
-GPIO pin 物理电平变化
-  → GPIO 模块检测到边沿
-    → EXTI 多路选择器（SYSCFG 配置）路由到 EXTI 控制器
-      → EXTI line 检测到中断
-        → GIC（Generic Interrupt Controller）接收 CPU 中断
-          → edge_irq_handler() → 将事件写入 kfifo
-            → 用户态通过 poll() / read() 读取事件
+GPIOG5 引脚电平跳变
+  → GPIOG 模块检测到边沿
+    → SYSCFG irqmux 选择 GPIOG5 连接到 EXTI line 5
+      → EXTI 控制器检测到边沿
+        → GIC 接收 CPU 中断（IRQ 64）
+          → edge_irq_handler 写事件到 kfifo
+            → wake_up(&lr->wait) 唤醒 poll
+              → 用户 read() 读取事件
 ```
 
 **gpiomon gpiochip6 5（监听 GPIOG5 边沿事件）的实际跟踪：**
