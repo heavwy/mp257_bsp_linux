@@ -13,14 +13,14 @@
 
 ## 4.1 概述
 
-03 篇完成了从系统启动到 pinctrl & GPIO 子系统全部就绪的初始化跟踪。本篇考察**初始化之后发生的事情**——当内核中的 consumer 设备（UART、SDMMC、I2C 等）和用户态程序真正使用这些子系统时，经历了怎样的代码路径。
+03 篇追踪了系统从启动到 pinctrl & GPIO 子系统全部就绪的初始化流程。本篇则聚焦**初始化完成之后**——当 consumer 设备（UART、SDMMC、I2C 等）和用户态程序真正使用这些子系统时，代码路径是怎样的。
 
 本篇选择两个最核心的场景：
 
 | 场景 | 起点 | 终点 | 涉及的核心路径 |
 |------|------|------|--------------|
 | **场景一：Consumer probe 设定引脚复用** | consumer 设备 probe → `pinctrl_bind_pins()` | `stm32_pmx_set_mode()` 写 AFRL/AFRH + MODER | `pinctrl_select_state()` → `create_pinctrl()` → `dt_to_map()` → `add_setting()` → `set_mux` 回调 |
-| **场景二：`/dev/gpiochip` 用户态 GPIO 控制** | `open("/dev/gpiochip0")` → `ioctl()` | `stm32_gpio_set/get()` 读写 BSRR/IDR | gpiolib cdev → gpiolib core → `gpio_chip` 回调 |
+| **场景二：`/dev/gpiochip` 用户态 GPIO 控制** | `open("/dev/gpiochip0")` → `ioctl()` | `stm32_gpio_set/get()` 读写 BSRR/IDR<br>`stm32_gpio_to_irq()` → EXTI → GIC | gpiolib cdev → gpiolib core → `gpio_chip` 回调（含 `set`/`get`/`to_irq`/`direction_output`） |
 
 ## 4.2 场景一：Consumer 设备 probe 的引脚复用设定
 
@@ -59,11 +59,18 @@ usart2_pins_a: usart2-0 {
 };
 ```
 
-**问题是**：当 USART2 驱动 probe 时，内核如何将 DTS 中的 `STM32_PINMUX('A', 4, AF6)`（PA4 作为 USART2_TX，alternate function 6）和 `STM32_PINMUX('A', 8, AF8)`（PA8 作为 USART2_RX，alternate function 8）转化为 GPIO 寄存器 MODER 和 AFRL/AFRH 中的具体值？
+**问题是**：USART2 驱动 probe 时，驱动代码里没有任何显式的 pinctrl 调用——那 PA4 和 PA8 是怎么自动变成 USART2 收发引脚的？从 DTS 中 `pinctrl-0 = <&usart2_pins_a>` 到 GPIO 寄存器 MODER/AFRL/AFRH 的具体值，中间经历了哪些代码路径？
 
 ### 4.2.2 完整调用链全景
 
+下面是整个场景一从 USART2 驱动 probe 触发到 GPIO 寄存器写入的完整路径。整体分三大步：
+
+1. **pinctrl_bind_pins** 由设备核心层自动调用，触发获取 pinctrl 句柄
+2. **create_pinctrl** 内部做了两次遍历——第一次把 DTS 中的 `pinctrl-0` 属性解析成通用的 map 条目（"PA4 要配成 af6"这种字符串形式），第二次把这些 map 条目转成当前 pin controller 能直接用的整数 setting（group=4, func=7）
+3. **pinctrl_select_state** 分两阶段执行 setting——先调 `pinmux_enable_setting` 写 AFRx + MODER 选择复用功能，再调 `pinconf_apply_setting` 写 PUPDR/OTYPER/OSPEEDR 配置电气参数
+
 ```
+USART2 设备驱动 probe
 USART2 设备驱动 probe
   │
   │ [驱动核心层] driver_probe_device()  ← drivers/base/dd.c:636
@@ -167,20 +174,25 @@ really_probe(dev, drv)
 **入口文件：** `drivers/base/pinctrl.c:21`
 
 ```c
-// drivers/base/pinctrl.c:21-105
+// drivers/base/pinctrl.c:21
 int pinctrl_bind_pins(struct device *dev)
 {
     int ret;
 
+    // of_node_reused 标记的节点（如由内核直接创建的虚拟设备）不需要 pinctrl
+    // USART2 的 of_node 来自 DTS → 不走此分支
     if (dev->of_node_reused)
         return 0;
 
-    // ① 分配 dev->pins（struct dev_pin_info）
+    // 在 dev->pins 中分配 dev_pin_info 结构体——之后 pinctrl_get 返回的句柄、
+    // 查找到的 default/init/sleep 等 state 指针都挂在这里
     dev->pins = devm_kzalloc(dev, sizeof(*(dev->pins)), GFP_KERNEL);
     if (!dev->pins)
         return -ENOMEM;
 
-    // ② 获取 pinctrl 句柄
+    // 调用 devm_pinctrl_get → pinctrl_get → create_pinctrl
+    // 这一步会触发完整的 DTS 解析（pinctrl_dt_to_map）+ setting 链表构建
+    // 如果 pin controller 驱动还没 probe 完，返回 -EPROBE_DEFER，USART2 的 probe 被延后
     dev->pins->p = devm_pinctrl_get(dev);
     if (IS_ERR(dev->pins->p)) {
         dev_dbg(dev, "no pinctrl handle\n");
@@ -188,7 +200,9 @@ int pinctrl_bind_pins(struct device *dev)
         goto cleanup_alloc;
     }
 
-    // ③ 查找 "default" state
+    // 在刚刚构建好的 states 链表中按名查找 "default"
+    // USART2 的 DTS 中有 pinctrl-0 = <&usart2_pins_a>，编译后的 state 名来自 pinctrl-names
+    // 所以能匹配到 pinctrl-names[0] = "default"
     dev->pins->default_state = pinctrl_lookup_state(dev->pins->p,
                                 PINCTRL_STATE_DEFAULT);
     if (IS_ERR(dev->pins->default_state)) {
@@ -197,19 +211,22 @@ int pinctrl_bind_pins(struct device *dev)
         goto cleanup_get;
     }
 
-    // ④ 查找 "init" state（可选）
+    // 查找 "init" state——这是可选的，DTS 中没有定义 pinctrl-init 时返回 -ENOENT
     dev->pins->init_state = pinctrl_lookup_state(dev->pins->p,
                                 PINCTRL_STATE_INIT);
 
     if (IS_ERR(dev->pins->init_state)) {
-        // ⑤ 没有 init state → 直接 select default state
+        // USART2 没配 pinctrl-init，所以走这里——直接应用 default state
+        // 这一步会真正调用 pinctrl_commit_state 去写硬件寄存器
         ret = pinctrl_select_state(dev->pins->p,
                                     dev->pins->default_state);
     } else {
+        // 如果有 init state（比如某些设备需要 probe 前先配成特定状态），则先选 init
         ret = pinctrl_select_state(dev->pins->p, dev->pins->init_state);
     }
 
-    // ⑥ 另外查找 sleep 和 idle state（CONFIG_PM 时）
+    // 如果内核开启了 CONFIG_PM，还会另外查找 sleep 和 idle state
+    // 它们不会现在应用，而是缓存在 dev_pin_info 中供系统休眠时切换
     // ...
 
     return 0;
@@ -259,7 +276,13 @@ struct dev_pin_info {
 
 #### devm_pinctrl_get → pinctrl_get → create_pinctrl
 
-`devm_pinctrl_get` 是 devres 管理的版本——自动释放，不需要手动调用 `pinctrl_put`：
+这节展开看 `pinctrl_bind_pins` 第 ② 步的调用链。`devm_pinctrl_get` 包了三层：
+
+- **`devm_pinctrl_get`**：devres 管理，创建一个 devres 资源来保存 `struct pinctrl *` 指针，probe 失败或设备移除时自动释放
+- **`pinctrl_get`**：遍历全局 `pinctrl_list` 链表，看 USART2 对应的 `struct pinctrl` 结构体是否已经创建过。有就直接返回，不用再走一遍 create_pinctrl
+- **`create_pinctrl`**：创建一个 `struct pinctrl` 结构体，内部完成 DTS 解析 + setting 链表构建，**不写硬件**
+
+还有一个关键点：`create_pinctrl(dev, NULL)` 第二个参数传的是 NULL——USART2 不知道自己的 pin controller 是谁，需要进去之后通过 DTS phandle 找到 `pinctrl@44240000`。如果 pin controller 还没 probe 完，这里返回 `-EPROBE_DEFER`。
 
 ```c
 // drivers/pinctrl/core.c:1379
@@ -283,29 +306,59 @@ struct pinctrl *devm_pinctrl_get(struct device *dev)
 }
 ```
 
-`pinctrl_get` 先查缓存（同一个 device 之前是否调过），没有就创建：
+`pinctrl_get` 先遍历全局 `pinctrl_list` 链表，看 USART2 对应的 `struct pinctrl` 结构体是否已经创建过。USART2 是第一次 probe，没有匹配项，于是调用 `create_pinctrl(dev, NULL)`：
 
 ```c
-// drivers/pinctrl/core.c:1131 (简化)
+// drivers/pinctrl/core.c:1131
 struct pinctrl *pinctrl_get(struct device *dev)
 {
     struct pinctrl *p;
 
+    // 遍历全局 pinctrl_list：此时链表中只有 pinctrl 驱动自身 hog 时创建的条目，
+    // 没有 p->dev == 当前 USART2 device 的条目 → 返回 NULL
     p = find_pinctrl(dev);
     if (p) {
         dev_dbg(dev, "obtain a copy of previously claimed pinctrl\n");
         return p;
     }
 
+    // USART2 走这里：首次创建，第二个参数 NULL 表示非 hog 场景，
+    // 进去之后需要通过 DTS phandle 找到 pinctrl@44240000
     return create_pinctrl(dev, NULL);
 }
 ```
 
-`find_pinctrl` 遍历全局 `pinctrl_list` 链表，检查 `p->dev == dev`。第一次 probe 时必然找不到，调用 `create_pinctrl`。
+`find_pinctrl` 加锁遍历全局 `pinctrl_list` 链表，对每个节点比较 `p->dev == dev`——看这个 device 之前有没有创建过 `struct pinctrl` 结构体。如果没有，返回 NULL。
+
+```c
+// drivers/pinctrl/core.c:1026
+static struct pinctrl *find_pinctrl(struct device *dev)
+{
+    struct pinctrl *p;
+
+    mutex_lock(&pinctrl_list_mutex);
+    list_for_each_entry(p, &pinctrl_list, node)
+        if (p->dev == dev) {         // 匹配条件：pinctrl 句柄的 dev 指针 == 当前 device
+            mutex_unlock(&pinctrl_list_mutex);
+            return p;
+        }
+
+    mutex_unlock(&pinctrl_list_mutex);
+    return NULL;                      // USART2 第一次调用，没有匹配项
+}
+```
+
+USART2 是第一次调用，`pinctrl_list` 中没有 `p->dev` 指向 USART2 device 的条目，所以返回 NULL，接着走 `create_pinctrl(dev, NULL)`。
 
 ### 4.2.5 Stage 2: create_pinctrl — 两次遍历核心机制
 
-`create_pinctrl` 是 pinctrl 子系统的核心函数。它完成从 DTS 属性到内存中 `pinctrl_setting` 链表的全部转换。关键在于它做了**两次遍历**，视线不同。
+`create_pinctrl` 是这个场景中最核心的函数。它分两次遍历完成两件事：
+
+**第一次遍历**：读 USART2 的 DTS 节点，找到 `pinctrl-0 = <&usart2_pins_a>`，顺着 phandle 找到 `usart2_pins_a` 节点，把 PA4 和 PA8 的 pinmux 配置解析成 4 个通用的 map 条目——"PA4 要配成 af6"、"PA4 要配 bias-disable"这种字符串形式
+
+**第二次遍历**：把这 4 个 map 条目转成当前 pin controller 能直接用的 setting——原来存的是字符串 "PA4""af6"，现在换成整数索引 group=4、func=7
+
+最终 USART2 的 `struct pinctrl` 结构体里就有了一个叫 "default" 的 state，下面挂着 4 个 setting 节点。**注意到这里还没有写硬件寄存器。**
 
 ```c
 // drivers/pinctrl/core.c:1043
@@ -578,6 +631,7 @@ DTB 二进制:
 ```c
 int pinctrl_dt_to_map(struct pinctrl *p, struct pinctrl_dev *pctldev)
 {
+    // USART2 的 of_node 指向 &usart2 节点，里面有 pinctrl-0/pinctrl-1/pinctrl-2 属性
     struct device_node *np = p->dev->of_node;
     int state, ret;
     char *propname;
@@ -592,11 +646,18 @@ int pinctrl_dt_to_map(struct pinctrl *p, struct pinctrl_dev *pctldev)
 
     of_node_get(np);
 
+    // 循环 0, 1, 2, ... 分别对应 pinctrl-0, pinctrl-1, pinctrl-2, ...
     for (state = 0; ; state++) {
+        // 第 1 次: propname = "pinctrl-0", 在 USART2 节点中找到该属性 ✓
+        // 第 2 次: propname = "pinctrl-1", 找到 ✓
+        // 第 3 次: propname = "pinctrl-2", 找到 ✓
+        // 第 4 次: propname = "pinctrl-3", 找不到 ✗ → break
         propname = kasprintf(GFP_KERNEL, "pinctrl-%d", state);
         prop = of_find_property(np, propname, &size);
         kfree(propname);
         if (!prop) {
+            // state=0 就找不到 pinctrl-0 → 说明设备没有 pinctrl 配置，返回错误
+            // state>0 找不到 → 正常结束循环
             if (state == 0) {
                 ret = -ENODEV;
                 goto err;
@@ -604,20 +665,30 @@ int pinctrl_dt_to_map(struct pinctrl *p, struct pinctrl_dev *pctldev)
             break;
         }
 
+        // prop->value 指向 DTB 中 pinctrl-0 的二进制数据：如 [00 00 12 34]
         list = prop->value;
-        size /= sizeof(*list);
+        size /= sizeof(*list);     // 除以 4 得到 phandle 个数，pinctrl-0 只有 1 个 phandle
 
+        // 从 pinctrl-names 属性中取这个 state 的名字
+        // pinctrl-names = "default", "idle", "sleep"
+        // state=0 → statename = "default"
+        // state=1 → statename = "idle"
+        // state=2 → statename = "sleep"
         ret = of_property_read_string_index(np, "pinctrl-names",
                             state, &statename);
         if (ret < 0)
             statename = prop->name + strlen("pinctrl-");
 
+        // 遍历每个 phandle：pinctrl-0 中只有一个 phandle（usart2_pins_a）
+        // 如果 pinctrl-0 = <&usart2_pins_a &some_other_pins>，size 就是 2
         for (config = 0; config < size; config++) {
-            phandle = be32_to_cpup(list++);
+            phandle = be32_to_cpup(list++);        // 如 0x00001234
 
+            // 通过 phandle 找到 usart2_pins_a 节点在内存中的 device_node
             np_config = of_find_node_by_phandle(phandle);
             if (!np_config) { ret = -EINVAL; goto err; }
 
+            // 把 usart2_pins_a 节点交给下一级处理，生成 map 条目
             ret = dt_to_map_one_config(p, pctldev, statename, np_config);
             of_node_put(np_config);
             if (ret < 0) goto err;
@@ -2069,7 +2140,40 @@ gpioh: gpio@442b0000 {
 | bank 内引脚数 | 12 | ngpios |
 | pinctrl pin 号范围 | 114~125 | gpio-ranges: pin_base=114, npins=12 |
 
-### 4.3.2 路径全貌
+### 4.3.2 场景总览
+
+**场景在做什么**
+
+用户态程序（如 `gpioset`/`gpioget`/`gpiomon`）通过 `/dev/gpiochipN` 字符设备操作 GPIO——打开设备、ioctl 请求 line、然后读写电平或监听中断。整个过程从用户态 system call 一路下沉到 GPIO 寄存器：
+
+| 层 | 做了什么 | 输出 |
+|---|---------|------|
+| **用户态** | libgpiod 封装 `open/ioctl` 系统调用 | 系统调用陷入内核 |
+| **gpiolib cdev** | 处理 `ioctl` 路由，分配 `linereq`，管理 line 请求 | 返回 fd，设置方向/中断 |
+| **gpiolib core** | 管理 `gpio_desc`，方向/电平操作的通用逻辑 | 调用 `gpio_chip` 回调 |
+| **STM32 驱动** | 实现 `gpio_chip` 回调：`set`→写 BSRR，`get`→读 IDR，`direction_output`→写 MODER | 物理寄存器被操作 |
+
+**最终结果**
+
+```
+输出模式:  MODER bits[11:10] = 0b01 → GPIOH5 为输出模式
+写电平:    BSRR @ 0x442b0000 写 BIT(5) → GPIOH5 输出高电平
+读电平:    IDR @ 0x442b0000 读 BIT(5) → 返回 0 或 1
+中断:      gpiod_to_irq() → irq_create_fwspec_mapping() → Linux IRQ 号
+```
+
+用户态到硬件的完整路径可以概括为 5 步：
+
+```
+gpioset gpiochip7 5=1
+  → ① open("/dev/gpiochip7")     ← 字符设备
+    → ② ioctl(GET_LINE_IOCTL)    ← 请求 line 5
+      → ③ gpiod_direction_output ← 设方向
+        → ④ gpiod_set_value      ← 设电平（或 ioctl 设值）
+          → ⑤ writel(BSRR)       ← 写硬件寄存器
+```
+
+### 4.3.3 路径全貌
 
 ```
 用户态 (gpioset/gpioget/gpiomon 或自定义程序)
@@ -2110,7 +2214,7 @@ gpioh: gpio@442b0000 {
             → request_threaded_irq() → EXTI → GIC
 ```
 
-### 4.3.3 字符设备的创建
+### 4.3.4 字符设备的创建
 
 `/dev/gpiochipN` 设备的创建发生在 03 中讲的 `gpiochip_add_data()` 流程内部。
 
@@ -2169,7 +2273,7 @@ crw------- 1 root root 254, 7 Jan 1  1970 /dev/gpiochip7   ← GPIOH
 
 每个 GPIO bank 一个独立的字符设备。设备号主编号相同（254），次编号为 bank 的注册顺序（gpio_device.id）。
 
-### 4.3.4 open("/dev/gpiochipN") — 初始化 chardev 数据
+### 4.3.5 open("/dev/gpiochipN") — 初始化 chardev 数据
 
 ```c
 // drivers/gpio/gpiolib-cdev.c:2881
@@ -2213,7 +2317,7 @@ file  (用户态 fd)
                        └─ events: event FIFO (line 状态变更事件)
 ```
 
-### 4.3.5 ioctl 路由 — 从 gpio_ioctl 到 linereq_create
+### 4.3.6 ioctl 路由 — 从 gpio_ioctl 到 linereq_create
 
 用户调用 `ioctl(fd, GPIO_V2_GET_LINE_IOCTL, &req)` 时，内核 VFS 层调用 `gpio_fileops.unlocked_ioctl`，即 `gpio_ioctl`。
 
@@ -2518,7 +2622,7 @@ stm32_gpio_request(chip=GPIOH, offset=5)
 
 > **注意**：`chip->base` 在 `gpiochip_add_data` 时由系统分配（或 DTS 中 `gpio-ranges` 的首个编号），GPIOH 的 base = 112。
 
-### 4.3.6 方向配置：从 gpiod_direction_output 到 MODER 寄存器
+### 4.3.7 方向配置：从 gpiod_direction_output 到 MODER 寄存器
 
 ```c
 if (flags & GPIO_V2_LINE_FLAG_OUTPUT) {
@@ -2560,7 +2664,7 @@ static int stm32_pmx_gpio_set_direction(struct pinctrl_dev *pctldev,
 }
 ```
 
-### 4.3.7 写 GPIO：从 ioctl 到 BSRR 寄存器
+### 4.3.8 写 GPIO：从 ioctl 到 BSRR 寄存器
 
 用户在获得 line request 的 fd 后，通过 `GPIO_V2_LINE_SET_VALUES_IOCTL` 写值：
 
@@ -2632,7 +2736,7 @@ writel_relaxed(BIT(21), 0x442b0000 + 0x18)
 
 > **为什么不用写 ODR？** BSRR 是**原子操作**——写 1 的位生效，写 0 的位不影响。而 ODR 需要读-改-写，在多线程/中断上下文中可能存在竞态问题。BSRR 的设计确保了单次写入即可安全地 set 或 reset 一个引脚，无需额外的锁保护。
 
-### 4.3.8 读 GPIO：从 ioctl 到 IDR 寄存器
+### 4.3.9 读 GPIO：从 ioctl 到 IDR 寄存器
 
 ```c
 // gpiolib-cdev.c:1435
@@ -2697,7 +2801,7 @@ val & BIT(5)                               // 如果高电平→非0→return 1
                                            // 如果低电平→0→return 0
 ```
 
-### 4.3.9 中断：GPIO → EXTI → GIC（gpiomon 路径）
+### 4.3.10 中断：GPIO → EXTI → GIC（gpiomon 路径）
 
 当用户执行 `gpiomon gpiochip6 5` 时，libgpiod 调用 ioctl 请求 line 并配置边沿检测：
 
@@ -2829,7 +2933,7 @@ GPIO pin 物理电平变化
 
 > GPIO 中断在 03 的 probe 流程中已经配置好 irq_domain 层次结构：`stm32_pctrl_get_irq_domain()` 在 probe 早期创建每个 bank 的 irq_domain，`stm32_gpio_to_irq()` 就是在这个层次化的 domain 中查找映射关系。
 
-### 4.3.10 场景二完全验证
+### 4.3.11 场景二完全验证
 
 **设备：** ATK 板用户 LED 连接 GPIOH5。
 
@@ -2892,7 +2996,7 @@ gpiod_set_value(desc, 0) 后:
   val & BIT(5) → 0x20 (高) 或 0x00 (低)
 ```
 
-### 4.3.11 两种 GPIO 使用路径的互通性
+### 4.3.12 两种 GPIO 使用路径的互通性
 
 场景一是"外设功能 mux"（consumer probe），场景二是"GPIO 作为 GPIO 使用"。它们操作的是**同一套寄存器**，但视角不同：
 
