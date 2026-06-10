@@ -4,7 +4,7 @@
 >
 > 每个数据结构背后都对应一个真实的历史问题。本文从 Linux v1.0 到 v6.6，沿着中断子系统的关键节点，追溯**每个机制是在解决什么问题**。
 >
-> **字数**：约 25,000 字 · **建议阅读时间**：60~90 分钟
+> **字数**：约 16,000 词 · **建议阅读时间**：60~90 分钟
 
 ---
 
@@ -1270,7 +1270,24 @@ virq 的 mask 操作：
       → gic_chip->irq_mask(data)     ← GIC 写 GICD_ICENABLER
 ```
 
-层级域不是用来替代链式的——它解决的是**链式无法处理的问题**：当中间层控制器需要参与每一级硬件操作时，链式的"父 handler 手动分发"无法满足递归操作的需求。
+**设备树中的体现**：层级关系也反映在设备树上。STM32MP257 的设备树（`stm32mp251.dtsi`）中，pinctrl/GPIO 节点的 `interrupt-parent` 指向 `&exti1`，而 `exti1` 节点声明的 `interrupts-extended` 又指向 `&intc`（GIC），每个 event 单独占用一个 SPI：
+
+```dts
+pinctrl@44240000 {                  /* GPIO */
+    interrupt-parent = <&exti1>;    /* ← GPIO 的中断由 EXTI 处理 */
+};
+
+exti1: interrupt-controller@44220000 {
+    interrupts-extended =           /* ← EXTI 自身的中断由 GIC 处理 */
+        <&intc GIC_SPI 268 IRQ_TYPE_LEVEL_HIGH>,  /* event 0 */
+        <&intc GIC_SPI 269 IRQ_TYPE_LEVEL_HIGH>,  /* event 1 */
+        ...;
+};
+```
+
+这里的 `interrupt-parent` 引用链（GPIO → EXTI → GIC）与内核中 `domain->parent` 指针链完全对应。设备树中的父子关系，到内核中就是 irq_domain 的层级绑定和 `irq_domain_alloc_irqs_parent()` 的递归调用。
+
+层级域不是用来替代链式的，它们对应不同的硬件拓扑：链式用于多对一（多个子中断共享一个父中断），层级域用于一对一（每个子中断有独立父中断线）。没有"哪个更好"——如果硬件设计是多对一拓扑，链式就是正确方案；如果硬件设计是一对一拓扑，层级域就是正确方案。
 
 ### 两种方案对比
 
