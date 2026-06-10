@@ -306,6 +306,13 @@ struct irq_chip {
 };
 ```
 
+`irq_chip` 的设计模式是 **vtable（虚函数表）**——每个中断控制器提供一个实例，填充自己硬件对应的回调。以 STM32MP257 为例：GIC 的 `chip` 调用 `gic_eoi_irq()` 写 `GICC_EOIR`，GPIO 控制器的 `chip` 则调用 `stm32_gpio_irq_unmask()` 操作 `GPIO_ICR`。上层的 `handle_fasteoi_irq()` 只调用 `chip->irq_eoi()`，完全不知道底层是什么硬件。
+
+相比上一代的 `hw_interrupt_type`（只定义了 `ack`、`end` 两个模糊回调），`irq_chip` 有两大改进：
+
+- **细粒度原语**：mask/unmask/ack/eoi 各司其职。`mask_ack` 合并操作是可选优化——如果不提供，流控函数会分别调用 `mask` 和 `ack`
+- **扩展接口**：`set_type` 配置触发方式（电平/边沿），`set_wake` 配置中断能否唤醒系统，`set_affinity` 配置 SMP 路由——这些都是 `hw_interrupt_type` 时代没有的
+
 **struct irq_desc** — 中断描述符（当前内核 `include/linux/irqdesc.h` L55）：
 
 ```c
@@ -320,62 +327,159 @@ struct irq_desc {
 };
 ```
 
+`irq_desc` 是中断子系统的**中心控制块**。系统中有多少个 IRQ 号，就有多少个 `irq_desc`。关键字段的设计意图：
+
+- **`handle_irq`**：这是 Gleixner 改造的最终落地成果。每个 IRQ 在 setup 时确定流控函数（电平中断挂 `handle_level_irq`，GIC 中断挂 `handle_fasteoi_irq`），运行时直接通过函数指针调用，不再需要 `__do_IRQ()` 那样的超级判断器
+- **`action` 链表**：支持中断共享（`IRQF_SHARED`）。同一条 IRQ 线上挂多个设备时，所有 `irqaction` 串成链表依次执行，通过 `action->dev_id` 参数区分具体是哪个设备触发了中断
+- **`depth`**：`disable_irq()` 嵌套计数。内核代码中可能存在路径重叠调用 `disable_irq()` 的情况，depth 保证只有等所有调用者都调用了 `enable_irq()` 之后才真正解屏蔽
+- **`wake_depth`**：与 `depth` 对称，管理中断作为系统唤醒源的引用计数，`enable_irq_wake()` 和 `disable_irq_wake()` 必须配对调用
+
+**一个重要的演进细节**：v2.6 时代 `irq_desc` 存储在固定大小的 `irq_desc[NR_IRQS]` 数组中。到了 v3.x（commit `9c58bae` 附近），内核改为 radix tree（`irq_desc_tree`）动态分配，不再预占内存。但 `irq_desc` 本身的核心结构维持不变——这本身就说明了它在 v2.6 的设计已足够成熟。
+
 ### 2.4 流控函数的定型
 
-Generic IRQ Layer 定义了五种标准流控函数，每种对应一类中断处理场景。以下是从当前 `kernel/irq/chip.c` 中提取的核心逻辑对比：
+Generic IRQ Layer 定义了五种标准流控函数，每种对应一类中断处理场景。以下是从当前 `kernel/irq/chip.c` 中提取的核心逻辑，并绑定了实际硬件场景。
 
 **handle_level_irq（电平触发）**：
 
 ```c
 void handle_level_irq(struct irq_desc *desc)
 {
-    mask_ack_irq(desc);            /* 屏蔽中断 + 应答 */
-    handle_irq_event(desc);        /* 调用驱动 handler */
-    unmask_irq(desc);              /* 处理完后解屏蔽 */
+    raw_spin_lock(&desc->lock);
+    mask_ack_irq(desc);             /* ① 屏蔽 + 清 pending */
+    handle_irq_event(desc);         /* ② 调 handler（内部释放/重取锁） */
+    cond_unmask_irq(desc);          /* ③ 解屏蔽 */
+    raw_spin_unlock(&desc->lock);
 }
 ```
 
-电平信号保持有效，所以处理前必须屏蔽以防止同中断再次触发，处理完后才解屏蔽。
+电平信号会**持续保持有效**直到外设撤销。ack 虽然清除了 CPU 接口侧的 Pending 状态，但控制器硬件仍然检测到电平有效，立即再次将中断标记为 Pending——**在 handler 还没机会让设备撤销电平之前，下一个中断已经触发了**。如果不 mask，此循环会无限重复，形成中断风暴。所以流程必须是 mask → handle → unmask。而 `raw_spin_lock` 保护的是对 `irq_desc` 的并发访问——同一中断可能在另一个 CPU 上同时操作（如 affinity 迁移），需要保证 `istate`、`action` 链表的修改不被竞争。典型场景：
+
+- **PCI INTx（传统 PCI 中断线）**：PCI 设备通过 INTA/INTB/INTC/INTD 线拉低电平通知中断，直到驱动读写设备寄存器清除中断条件后信号才撤销。多个 `pcie-*` 主机控制器驱动（如 `drivers/pci/controller/pcie-xilinx-nwl.c`）将其子中断注册为 `handle_level_irq`
+- **GPIO 电平检测**（如 `drivers/gpio/gpio-brcmstb.c`）：GPIO 引脚配置为电平触发（高电平或低电平有效）时，信号电平持续保持有效，直到外设条件解除。如果不 mask，从 handler 返回后同一电平立即再次触发，形成无限重入——所以必须用 `handle_level_irq` 的 mask/unmask 模式处理
 
 **handle_edge_irq（边沿触发）**：
 
 ```c
 void handle_edge_irq(struct irq_desc *desc)
 {
-    if (desc->status & IRQ_INPROGRESS) {
-        mask_ack_irq(desc);        /* 正在处理中，屏蔽并标记 pending */
-        desc->status |= IRQ_PENDING;
-        return;
-    }
-    desc->irq_data.chip->irq_ack();      /* 仅应答，不屏蔽 */
-    desc->status |= IRQ_INPROGRESS;
+    raw_spin_lock(&desc->lock);
+
+    desc->irq_data.chip->irq_ack(&desc->irq_data);   /* 清 pending，允许检测下一个边沿 */
+
     do {
-        handle_irq_event(desc);
-    } while (desc->status & IRQ_PENDING); /* 处理期间又触发了，继续处理 */
-    desc->status &= ~IRQ_INPROGRESS;
+        handle_irq_event(desc);                       /* 调 handler（内部释放/重取锁） */
+    } while (desc->istate & IRQS_PENDING);            /* 处理期间又触发了？再来一次 */
+
+    raw_spin_unlock(&desc->lock);
 }
 ```
 
-边沿触发是"一次性"的，不会保持。如果上一中断还没处理完又来一个，必须记住（pending）。这是边沿中断最复杂的地方。
+说明：边沿信号跳变后不会保持，所以只需 ack 清除硬件锁存，不需要像 level 那样 mask。但如果 handler 正在执行时又来了一个同源边沿，内核会在嵌套路径中将 `IRQS_PENDING` 置位，外层 do-while 检测到后立即再处理一次，直到没有新的边沿到达。`raw_spin_lock` 保护 `desc->istate` 的 `IRQS_PENDING` 位操作和 `action` 链表的并发访问。
 
-**handle_fasteoi_irq（Fast EOI）**：
+这个简化的版本省去了异常保护分支（中断禁用、无 action、suspend 等），保留了 edge 流控的核心差异。典型场景：
+
+- **GPIO 边沿检测**（如 `drivers/gpio/gpio-mpc8xxx.c`、`drivers/gpio/gpio-sa1100.c`）：按键按下产生下降沿，松开产生上升沿。如果驱动在顶半部做较长的处理（如去抖），第二次按键可能在 handler 还没返回时就到达，pending 机制保证不丢失
+- **PMIC 子中断**（如 `drivers/mfd/max8998-irq.c`, `drivers/mfd/wm831x-irq.c`）：电源管理芯片通过一个 IRQ 线向 SoC 报告多种事件，芯片内部的中断控制器将各路子中断注册为 `handle_edge_irq`
+
+**handle_fasteoi_irq（Fast EOI）——现代中断控制器的标准**：
 
 ```c
 void handle_fasteoi_irq(struct irq_desc *desc)
 {
-    handle_irq_event(desc);              /* 直接处理 */
-    desc->irq_data.chip->irq_eoi(desc);  /* 处理完后发 EOI */
+    raw_spin_lock(&desc->lock);
+
+    handle_irq_event(desc);                        /* ① 调 handler（内部释放/重取锁） */
+    desc->irq_data.chip->irq_eoi(&desc->irq_data); /* ② 写 EOI 寄存器 */
+
+    raw_spin_unlock(&desc->lock);
 }
 ```
 
-Fast EOI 模式是最简洁的——不需要 mask/unmask，因为中断控制器（如 GIC）有自己的 EOI 寄存器，写一次 EOI 硬件自动完成状态清除。这是现代高级中断控制器（GIC、MSI）的标准模式。
+这是最简洁的模式——**不需要 mask/unmask**。因为高级中断控制器（GIC、MSI）硬件内部维护着中断状态机：CPU 读中断后，GIC 自动将 Distributor 侧对应中断标记为 Pending-Inservice；写 `GICC_EOIR` 后硬件自动清除，允许下次触发。handler 还在跑时同一中断再次到达，GIC 会再次标记 Pending，不会像 level 那样无限递归。`raw_spin_lock` 在此保护的是 affinity 迁移等场景下对 `irq_desc` 的并发访问。
 
-**v6.6.78 内核中 STM32MP257 的 GPIO 按键中断正是使用 `handle_fasteoi_irq`**，这一点可以通过你的实测数据验证：
+典型场景：
+- **ARM GIC**（`drivers/irqchip/irq-gic-v3.c` L598）：`desc->handle_irq = handle_fasteoi_irq` — 所有通过 GIC 路由的中断都使用此模式，包括 STM32MP257 的 GPIO 按键中断、UART 中断、timer 中断等
+- **sun4i 中断控制器**（`drivers/irqchip/irq-sun4i.c` L96）
+
+以下是你可以在开发板上验证的实际数据：
 
 ```
 root@buildroot:~# cat /sys/kernel/debug/irq/irqs/70
 handler:  handle_fasteoi_irq
 ```
+
+每个中断源（包括 GPIO 按键、UART、timer）的 handler 都是 `handle_fasteoi_irq`——因为 STM32MP257 的所有外设中断都通过 GIC 路由。
+
+**handle_simple_irq（简单模式）——无硬件操作需求**：
+
+```c
+void handle_simple_irq(struct irq_desc *desc)
+{
+    raw_spin_lock(&desc->lock);
+    handle_irq_event(desc);      /* 唯一做的事：调用驱动 handler */
+    raw_spin_unlock(&desc->lock);
+}
+```
+
+`handle_simple_irq` **不调用任何 `chip->irq_ack/mask/unmask/eoi`**——它只需要执行 handler，不需要操作硬件寄存器。但 `action` 链表和 `istate` 状态的并发保护仍然需要，所以同样持有 `desc->lock`。适用于"子中断"展开场景：物理中断已经被父驱动处理了，子中断只是软件层面的事件。
+
+典型场景——**I2C 接的 GPIO 扩展芯片**（`gpio-pca953x.c`）：
+
+这类芯片有多个 GPIO 引脚可以产生中断，但芯片本身只有**一条 IRQ 线**连到 SoC。芯片驱动注册中断时没有顶半部，只有 threaded handler（`devm_request_threaded_irq(..., NULL, pca953x_irq_handler, ...)`）。发生中断时的流程：
+
+```
+PCA9535 某个引脚电平变化
+  → 芯片拉低 IRQ 线 → SoC 收到物理中断（硬中断）
+      → 内核唤醒 pca953x 驱动的 threaded handler（内核线程）
+          → pca953x_irq_handler（线程上下文，可以睡眠）
+              → 通过 I2C 读 PCA9535 的输入寄存器
+              → 知道哪个(些)引脚发生了变化
+              → 对每个变化的引脚，调 handle_nested_irq(该引脚的虚拟 IRQ 号)
+                  → 查 irq_desc → handle_simple_irq → 驱动的 handler
+```
+
+整个流程从 threaded handler 开始都在内核线程中执行。`handle_nested_irq` 将子中断的 handler 在当前线程上下文中同步调用，不需要走 GIC 硬件。`gpio-pca953x.c`（`drivers/gpio/gpio-pca953x.c` L956-958, L901, L952）正是这样用的。
+
+为什么不需要 ack/mask？因为 **I2C 读寄存器这一步已经把芯片硬件上的中断状态清除了**——PCA9535 的 IRQ 线在寄存器被读取后自动撤销。子中断没有独立的硬件控制器，不需要再操作任何寄存器。
+
+**handle_percpu_irq（每 CPU 中断）——SMP 专用**：
+
+```c
+void handle_percpu_irq(struct irq_desc *desc)
+{
+    if (chip->irq_ack)  chip->irq_ack(&desc->irq_data);   /* 可选 ack */
+    handle_irq_event_percpu(desc);                         /* 无锁遍历 action */
+    if (chip->irq_eoi)  chip->irq_eoi(&desc->irq_data);   /* 可选 EOI */
+}
+```
+
+最关键的特征是**无锁设计**：per-CPU 中断只发给一个固定的 CPU，不会跨核心迁移，因此不需要 spinlock 保护——这是 GIC PPI（Private Peripheral Interrupt）的硬件保证。典型场景：
+
+- **CPU 本地 timer 中断**（`drivers/irqchip/irq-mips-cpu.c`、`drivers/irqchip/irq-loongarch-cpu.c`）
+- ARM64 架构中 GIC 的 PPI（如 `__IPI`、`arch_timer`）也使用类似的无锁处理方式
+
+---
+
+注意看代码中的 `raw_spin_lock(&desc->lock)`。为什么前四种需要加锁而 percpu 不需要？
+
+`irq_desc` 是共享数据结构，系统中所有中断共用一个 `irq_desc` 数组/树。两个 CPU 可能同时处理不同的中断——但**同一中断**也可能被两个 CPU 同时操作（比如 affinity 迁移期间、或 level 中断在 SMP 上的竞争）。`desc->lock` 保护的是对这个 `irq_desc` 实例的并发访问：修改 `istate` 状态位、遍历/修改 `action` 链表、操作 `depth` 计数等。
+
+per-CPU 中断（PPI）的"免锁"特权来自硬件保证：GIC 的每个 PPI 只发送给一个指定的 CPU，不会跨核心。既然**只有一个 CPU 会访问这个 `irq_desc`**，spinlock 就是多余的。
+
+**五种流控函数的横向对比**：
+
+| 函数 | 是否 spinlock | 是否 mask/unmask | 是否需要 ack | 是否需要 EOI | 典型硬件 |
+|------|:---:|:---:|:---:|:---:|---------|
+| `handle_level_irq` | ✅ 需要 | ✅ mask_ack + unmask | ✅ | ❌ | PCI INTx、GPIO 电平模式 |
+| `handle_edge_irq` | ✅ 需要 | 处理中才 mask | ✅ ack 即可 | ❌ | GPIO 边沿、PMIC 子中断 |
+| `handle_fasteoi_irq` | ✅ 需要 | ❌ | ❌ | ✅ EOI | ARM GIC、MSI |
+| `handle_simple_irq` | ✅ 需要 | ❌ | ❌ | ❌ | 软件模拟中断、I2C 子中断 |
+| `handle_percpu_irq` | ❌ **不需要** | ❌ | 可选 | 可选 | CPU 本地 timer、GIC PPI |
+
+此外，在 v4.x/v5.x 内核中又增加了两种变体：`handle_edge_eoi_irq`（边沿触发 + EOI，用于需要边沿语义的 GICv3 层次域）和 `handle_fasteoi_mask_irq`（需要在 EOI 前 mask，用于部分需要 mask+EOI 顺序的 irq_chip）。这两种变体是对五种基本流控函数的补充，不改变核心分层设计。
+
+**总结**：五种流控函数的差异归结为一个问题——**中断控制器硬件需要软件做什么才能安全地处理下一个中断？** 有的需要 mask/unmask（level），有的只需 ack（edge），有的只需 EOI（fasteoi），有的什么都不需要（simple），有的每个 CPU 各自独立处理（percpu）。流控函数将这种需求差异封装为可替换的函数指针，上层驱动统一调用 `request_irq()`，不需要关心底层差异。
 
 ### 2.5 __do_IRQ() 的弃用与移除
 
@@ -419,29 +523,141 @@ kernel/irq/
 
 ### 3.1 BH（Bottom Half）— v2.1 引入
 
-第 1 节已经介绍了 BH 的基本问题。这里补充其核心数据结构：
+第 1 节已经介绍了 BH 的设计思路和它为什么不可睡眠。这里补充 BH 的具体实现机制和驱动使用方式。
+
+**数据结构**（位于 `kernel/softirq.c`，全局变量，所有 CPU 共享）：
 
 ```c
-/* 全局 BH 状态 — 一次只能由一个 CPU 处理 */
-static unsigned long bh_active;          /* 标记哪些 BH 待处理 */
-static unsigned long bh_mask;            /* 标记哪些 BH 已注册 */
-static void (*bh_base[32])(void);        /* 32 个 BH 处理函数指针 */
-
-/* 唯一入口 */
-void do_bottom_half(void);
+static unsigned long bh_active;          /* 位图：标记哪些 BH 待处理 */
+static unsigned long bh_mask;            /* 位图：标记哪些 BH 已注册 */
+static void (*bh_base[32])(void);        /* 最多 32 个处理函数指针 */
 ```
 
-BH 的局限：
+BH 的处理函数被编号为 0~31，编号越大优先级越高（注意：不是越小越高）。`bh_active` 的 bit N 为 1 表示编号 N 的 BH 有待处理工作，`bh_mask` 的 bit N 为 1 表示编号 N 的 BH 已注册了 handler。
+
+**驱动使用 BH 的标准 API 和流程**：
+
+```c
+/* 1) 在 include/linux/interrupt.h 中枚举 BH 编号 */
+enum {
+    TIMER_BH = 0,
+    CONSOLE_BH,
+    SERIAL_BH,
+    BLOCK_BH,
+    IMMEDIATE_BH = 28,
+    KEYBOARD_BH = 29,
+    ...
+};
+
+/* 2) 驱动初始化时注册 handler — 填入 bh_base[nr] 并设 bh_mask 对应位 */
+init_bh(SERIAL_BH, serial_bh_handler);
+
+/* 3) 顶半部末尾触发 BH */
+irqreturn_t serial_irq_handler(int irq, void *dev_id)
+{
+    /* 从硬件接收 FIFO 搬运数据到内存缓冲区，硬件操作越短越好 */
+    ... 
+    mark_bh(SERIAL_BH);  /* bh_active |= BIT(SERIAL_BH) — 告诉内核：SERIAL_BH 有待处理工作 */
+    return IRQ_HANDLED;
+}
+
+/* 4) 可选：临时禁用/重新启用某个 BH（带嵌套计数 bh_mask_count[nr]） */
+disable_bh(SERIAL_BH);   /* bh_mask &= ~BIT(nr) */
+enable_bh(SERIAL_BH);    /* 减计数到 0 后 bh_mask |= BIT(nr) */
+
+/* 5) 驱动卸载时移除 */
+remove_bh(SERIAL_BH);    /* bh_base[nr] = NULL; bh_mask &= ~BIT(nr) */
+```
+
+**`do_bottom_half()` 的执行逻辑**——优先级最高的 BH 最先执行：
+
+```c
+void do_bottom_half(void)
+{
+    unsigned long active, pending;
+    int i;
+
+    /* 只取已注册且有挂起的 BH */
+    active = get_active_bhs();          /* bh_active & bh_mask */
+
+    raw_spin_lock_irq(&global_bh_lock);  /* ← 全局锁：同一时刻只有一个 CPU 能进来 */
+
+    do {
+        /* 找到最高优先级的待处理 BH（编号最大的） */
+        i = 31 - __builtin_clz(active);   /* fls(active) - 1 */
+        
+        /* 清除该位，防止重复执行 */
+        bh_active &= ~BIT(i);
+        
+        /* 释放锁 — 注意：执行 BH 期间其他 CPU 可以竞争这把锁 */
+        raw_spin_unlock_irq(&global_bh_lock);
+        
+        /* 执行 BH handler */
+        bh_base[i]();                      /* 同步调用，执行完才返回 */
+        
+        /* 重新上锁检查是否还有待处理工作 */
+        raw_spin_lock_irq(&global_bh_lock);
+        active = bh_active & bh_mask;
+    } while (active);
+
+    raw_spin_unlock_irq(&global_bh_lock);
+}
+```
+
+这个设计有两个关键行为：
+
+1. **优先级反转隐患**：执行 BH[N] 期间，如果有更高优先级的 BH[M]（M > N）被 `mark_bh` 触发，必须等当前 BH[N] 返回后才能重新进入 `do_bottom_half()` 扫描到 BH[M]——因为 `global_bh_lock` 是互斥的
+2. **释放锁窗口**：执行 `bh_base[i]()` 前释放了锁，其他 CPU 可以 `mark_bh` 并竞争锁，这是 SMP 下唯一的并发通道——但同一时刻仍然只能有一个 CPU 在执行 BH 代码
+
+**真实世界的 BH 使用——SERIAL_BH 例子**：
+
+串口驱动是 BH 的典型用户。以 16550 UART 为例，接收中断到来时顶半部只做一件事：从 `RBR` 寄存器读取收到的字节，放入一个内存缓冲区，然后 `mark_bh(SERIAL_BH)`。真正的协议处理（行规程、tty 层分发）在 SERIAL_BH 中完成：
+
+```
+串口接收中断（顶半部，IRQ 关闭）
+  → read RBR → push to flip buffer → mark_bh(SERIAL_BH) → return
+中断返回前 irq_exit() 检查 bh_active
+  → do_bottom_half()
+      → lock global_bh_lock
+      → 扫描最高优先级 BH（可能是 SERIAL_BH，也可能是 TIMER_BH）
+      → serial_bh_handler()
+          → 遍历 flip buffer → 按 tty 行规程处理 → wake up 读进程
+      → unlock global_bh_lock
+```
+
+这个模式的缺点是：串口收到的所有字节都在一个"原子上下文"中处理（不可睡眠），所以 tty 层不能做内存分配、不能等待——一旦 flip buffer 满而读进程还没来取走，数据就会丢失。
+
+**SMP 下的性能灾难——global_bh_lock 实测数据**：
+
+当你有一个 4 核 CPU 同时处理网络和磁盘中断时，`global_bh_lock` 的争用场景：
+
+| CPU 0 | CPU 1 | CPU 2 | CPU 3 |
+|-------|-------|-------|-------|
+| NET_BH 执行中 | 等待 global_bh_lock | 等待 global_bh_lock | 等待 global_bh_lock |
+| 持有锁 | 自旋 | 自旋 | 自旋 |
+
+三个 CPU 在空转等一把锁。更糟的是，顶半部 (`mark_bh`) 也需要竞争 `global_bh_lock`，这意味着**顶半部也在等锁**——中断延迟因此大幅增加。
+
+**BH 的完整局限回顾**：
 
 | 问题 | 表现 | 后果 |
 |------|------|------|
-| 固定 32 个 | 头文件里枚举，新增需改内核 | 子系统开发者无法动态注册 |
-| 全局互斥 | `global_bh_lock` 串行化所有 CPU | SMP 扩展性极差 |
-| 不可嵌套 | 执行中禁止被另一个 BH 抢占 | 响应延迟不可控 |
+| 固定 32 个 | 头文件里枚举，新增需改内核 | 子系统开发者无法动态注册新的下半部 |
+| 全局互斥 | `global_bh_lock` 串行化所有 CPU | SMP 扩展性极差，多核上 BH 完全串行 |
+| 不可嵌套 | 一次只执行一个 BH | 高优先级 BH 必须等低优先级的执行完 |
+| 不可睡眠 | `pt_regs` 在中断栈顶 | 无法处理需要等待 I/O 或内存分配的逻辑 |
+
+**BH 机制的遗产**：
+
+BH 本身在 v2.5 开发周期中被 softirq 取代，但它的概念留下了几个至今可见的影响：
+
+1. 软中断使用的 `__softirq_pending` 位图机制直接继承了 BH 的位图标记思路
+2. `HI_SOFTIRQ` 和 `TASKLET_SOFTIRQ` 这两个软中断向量就是为兼容旧的 BH 语义而保留的（高优先级下半部和普通下半部）
+3. 即使在 v6.6.78 内核中，仍有驱动通过头文件注释引用 `IMMEDIATE_BH`（如 `include/media/drv-intf/saa7146.h`），显示 BH 枚举多年来曾是内核 ABI 的一部分
 
 ### 3.2 Softirq — v2.3 重写（1999 年）
 
-1999 年，Alexey Kuznetsov（ANK）几乎重写了整个下半部系统，这是 softirq.c 头部注释的由来：
+1999 年，Alexey Kuznetsov（ANK）几乎重写了整个下半部系统。这次重写的核心目标是**彻底甩掉 BH 的全局锁瓶颈**。softirq.c 头部注释毫不留情：
 
 ```c
 /* linux/kernel/softirq.c
@@ -449,140 +665,379 @@ BH 的局限：
  */
 ```
 
-**Softirq 的核心设计原则**（来自 `softirq.c` 头部注释）：
+**对比 BH 解决的核心问题**：
 
-> - No shared variables, all the data are CPU local.
-> - If a softirq needs serialization, let it serialize itself by its own spinlocks.
-> - Even if softirq is serialized, only local cpu is marked for execution.
+| | BH (v2.1) | Softirq (v2.3) |
+|--|-----------|----------------|
+| pending 位图 | 全局 `bh_active`，所有 CPU 共享 | 每 CPU 的 `irq_stat.__softirq_pending` |
+| handler 表 | 全局 `bh_base[32]` | 全局 `softirq_vec[NR_SOFTIRQS]` |
+| 互斥 | `global_bh_lock` 全局锁 | **无锁** —— 每个 CPU 独立执行 |
+| 调用 context | 中断返回路径，IRQ 关闭 | 中断返回路径，**IRQ 打开** |
+| 数量限制 | 32 个硬编码 | 10 个（可通过 `NR_SOFTIRQS` 扩展） |
 
-翻译过来：
-- **CPU 本地数据**：不再有全局 `bh_active`，每个 CPU 有独立的 `__softirq_pending` 位图
-- **自串行化**：框架不提供互斥，需要串行化的软中断自己加锁
-- **每个 CPU 独立触发**：一个 CPU 上的软中断密集不会阻塞另一个 CPU
-
-v6.6.78 内核中 softirq 的 10 个向量（`include/linux/interrupt.h` L550）：
+**核心数据结构**（当前 v6.6.78 `kernel/softirq.c` L59, `include/linux/interrupt.h` L520-528）：
 
 ```c
-enum {
-    HI_SOFTIRQ = 0,        /* 高优先级 tasklet */
-    TIMER_SOFTIRQ,          /* 定时器 */
-    NET_TX_SOFTIRQ,         /* 网络发送 */
-    NET_RX_SOFTIRQ,         /* 网络接收 */
-    BLOCK_SOFTIRQ,          /* 块设备 I/O 完成 */
-    IRQ_POLL_SOFTIRQ,       /* 中断轮询 */
-    TASKLET_SOFTIRQ,        /* tasklet */
-    SCHED_SOFTIRQ,          /* 调度器 */
-    HRTIMER_SOFTIRQ,        /* 高精度定时器 */
-    RCU_SOFTIRQ,            /* RCU 回调 */
-    NR_SOFTIRQS             /* = 10 */
-};
+/* 全局函数表：一个向量一个 handler */
+static struct softirq_action softirq_vec[NR_SOFTIRQS] __cacheline_aligned_in_smp;
+
+/* 每 CPU pending 位图 —— 不再有全局 bh_active */
+DECLARE_PER_CPU(struct irq_stat, irq_stat);
+/* → 实际通过 local_softirq_pending() 访问 */
+
+#define local_softirq_pending()     __this_cpu_read(irq_stat.__softirq_pending)
+#define set_softirq_pending(x)      __this_cpu_write(irq_stat.__softirq_pending, (x))
+#define or_softirq_pending(x)       __this_cpu_or(irq_stat.__softirq_pending, (x))
 ```
 
-**Softirq 的执行时机**（`kernel/softirq.c` L653-665）：
+对比 BH：BH 所有 CPU 共享一个 `bh_active`，操作它需要 `global_bh_lock`。Softirq 把它改为每 CPU 一份，**写自己的位图不需要锁**——这就把 BH 时代最严重的 SMP 瓶颈直接消除了。
+
+**注册一个 softirq handler**（`kernel/softirq.c` L709-712）：
 
 ```c
+void open_softirq(int nr, void (*action)(struct softirq_action *))
+{
+    softirq_vec[nr].action = action;
+}
+```
+
+对比 BH 的 `init_bh(nr, handler)` 还需要操作 `bh_mask`。Softirq 的 `open_softirq` 只填一个函数指针，**没有 enable/disable 机制**——softirq 一旦注册就是永远可用的（对应 BH 的 `open_bh` 不存在了）。
+
+**触发一个 softirq**（`kernel/softirq.c` L676-707）：
+
+```c
+/* 核心操作：在 per-CPU 位图上设一个 bit */
+void __raise_softirq_irqoff(unsigned int nr)
+{
+    trace_softirq_raise(nr);
+    or_softirq_pending(1UL << nr);     /* per-CPU 位图操作，无需锁 */
+}
+
+/* 如果在中断上下文外触发，还需要唤醒 ksoftirqd */
+inline void raise_softirq_irqoff(unsigned int nr)
+{
+    __raise_softirq_irqoff(nr);
+    if (!in_interrupt() && should_wake_ksoftirqd())
+        wakeup_softirqd();             /* 当前不在中断中 → 唤醒线程来跑 */
+}
+
+/* 从非原子上下文调用的安全版本 */
+void raise_softirq(unsigned int nr)
+{
+    unsigned long flags;
+    local_irq_save(flags);             /* 关 IRQ，因为 __raise 要求 IRQ disabled */
+    raise_softirq_irqoff(nr);
+    local_irq_restore(flags);
+}
+```
+
+**重点理解 `raise_softirq` 的惰性调度策略**：
+
+- 如果在中断 handler 或另一个 softirq 中调用 → 只设 bit 就返回。因为中断/softirq 返回前会检查 pending，自然会执行
+- 如果在进程上下文中调用（如驱动在系统调用中触发）→ 设 bit + 唤醒 `ksoftirqd/N`。因为进程上下文没有 `irq_exit` 那种"每次中断返回后自动检查"的机制，只能靠 ksoftirqd 来兜底
+
+这就是 softirq 相比 BH 的关键改进：BH 只有 `irq_exit → do_bottom_half` 一条执行路径（如果错过了就等下一次中断），而 softirq 有两条互补路径——中断返回时在 `irq_exit` 中直接处理，加上进程上下文也可以通过 `ksoftirqd` 来兜底。
+
+**Softirq 的执行路径：irq_exit → invoke_softirq**
+
+在 ARM64 架构上，每次硬件中断处理完毕后会调用 `irq_exit()`，路径如下（`kernel/softirq.c` L597-691）：
+
+```c
+/* irq_exit_rcu — 中断出口门卫 */
 void irq_exit_rcu(void)
 {
-    __irq_exit_rcu();      /* ← 中断出口检查并执行软中断 */
+    __irq_exit_rcu();                   /* ← 检查并执行 softirq */
     lockdep_hardirq_exit();
 }
 
 static void __irq_exit_rcu(void)
 {
     if (!in_interrupt() && local_softirq_pending())
-        invoke_softirq();  /* 直接执行，或唤醒 ksoftirqd */
+        invoke_softirq();               /* 有 pending → 处理 */
 }
-```
 
-这意味着：**每次硬中断处理完毕后，在 `irq_exit_rcu()` 中检查是否有待处理的 softirq**。如果有，直接在当前上下文执行（`do_softirq()`），或者唤醒内核线程 `ksoftirqd/N` 在进程上下文中执行。
-
-### 3.3 Tasklet — 基于 Softirq 的简化封装
-
-Tasklet 是 softirq 之上最常用的封装，它的全部代码在 `kernel/softirq.c` 中，基于 `TASKLET_SOFTIRQ` 和 `HI_SOFTIRQ` 两个向量实现：
-
-```c
-/* v6.6.78 — kernel/softirq.c L717-723 */
-struct tasklet_head {
-    struct tasklet_struct *head;
-    struct tasklet_struct **tail;
-};
-
-static DEFINE_PER_CPU(struct tasklet_head, tasklet_vec);    /* 普通优先级 */
-static DEFINE_PER_CPU(struct tasklet_head, tasklet_hi_vec); /* 高优先级 */
-```
-
-Tasklet 的调度入口 `tasklet_schedule()` 做的事情很简单：
-1. 将 tasklet 加入当前 CPU 的 `tasklet_vec` 链表（如果还没加入）
-2. 触发 `TASKLET_SOFTIRQ` 软中断
-
-在 `irq_exit_rcu()` → `do_softirq()` → `tasklet_action()` 路径中，`TASKLET_SOFTIRQ` 的处理函数遍历链表执行已调度的 tasklet：
-
-```c
-static void tasklet_action_common(struct softirq_action *a,
-                                  struct tasklet_head *tl_head, ...)
+/* invoke_softirq — 决定是直接执行还是唤醒线程 */
+static inline void invoke_softirq(void)
 {
-    struct tasklet_struct *list;
-
-    /* 把链表从 per-CPU 摘下来，这样调度进来的新 tasklet 不会立即执行 */
-    list = tl_head->head;
-    tl_head->head = NULL;
-    tl_head->tail = &tl_head->head;
-
-    /* 遍历链表 */
-    while (list) {
-        struct tasklet_struct *t = list;
-        list = list->next;
-
-        if (tasklet_trylock(t)) {          /* 防止同 tasklet 多 CPU 并行 */
-            if (!atomic_read(&t->count)) { /* count=0 表示未被禁用 */
-                t->func(t->data);          /* ← 执行 tasklet 回调函数 */
-                tasklet_unlock(t);
-            }
-        }
+    if (!force_irqthreads()) {
+        __do_softirq();                 /* ← 直接在当前栈上执行 */
+    } else {
+        wakeup_softirqd();              /* CONFIG_IRQ_FORCED_THREADING */
     }
 }
 ```
 
-**Tasklet 与 Softirq 的关系**：
+这个检查中的 `!in_interrupt()` 是关键保护：如果当前已经嵌套在另一个 softirq 中（`in_interrupt()` 为 true），就不递归执行，而是让外层返回后再处理。
+
+**`handle_softirqs()` — 实际处理函数**（`kernel/softirq.c` L517-590，v6.6.78）：
+
+```c
+static void handle_softirqs(bool ksirqd)
+{
+    unsigned long end = jiffies + MAX_SOFTIRQ_TIME;       /* 超时：2ms */
+    unsigned long old_flags = current->flags;
+    int max_restart = MAX_SOFTIRQ_RESTART;                 /* 最大重试：10 次 */
+    struct softirq_action *h;
+    __u32 pending;
+    int softirq_bit;
+
+    pending = local_softirq_pending();                     /* 快照当前 pending */
+
+restart:
+    /* 清空 pending 位图，然后打开 IRQ */
+    set_softirq_pending(0);
+    local_irq_enable();                                    /* ← IRQ 使能！ */
+
+    h = softirq_vec;
+    /* ffs: find first set — 最低编号的软中断优先处理（0=HI_SOFTIRQ 优先级最高） */
+    while ((softirq_bit = ffs(pending))) {
+        unsigned int vec_nr = (h + (softirq_bit - 1)) - softirq_vec;
+        h += softirq_bit - 1;
+
+        h->action(h);                                      /* ← 调用软中断 handler */
+        h++;
+        pending >>= softirq_bit;
+    }
+
+    /* 处理完后，关 IRQ 检查是否又有新的 pending 了 */
+    local_irq_disable();
+    pending = local_softirq_pending();
+    if (pending) {
+        /* 没超时、没人请求 resched、还没重试满 10 次 → 再来一轮 */
+        if (time_before(jiffies, end) && !need_resched() && --max_restart)
+            goto restart;
+        /* 否则交给 ksoftirqd 兜底 */
+        wakeup_softirqd();
+    }
+}
+```
+
+这个设计中有几个关键决策：
+
+1. **ffs（find first set）编号越小优先级越高**。`HI_SOFTIRQ=0` 优先于 `TIMER_SOFTIRQ=1` 优先于 `NET_TX_SOFTIRQ=2`……这和 BH 的"编号越大优先级越高"正好相反
+2. **`local_irq_enable()` — softirq 在 IRQ 打开下执行**。这点 BH 和 softirq 一致（BH 在调 handler 前也释放了锁），但两者在并发模型上有根本区别：
+
+   - **BH**：`do_bottom_half()` 扫描位图和调 handler 期间持有 `global_bh_lock`，同一时刻全局只有一个 CPU 在执行 BH。handler 执行期间 IRQ 打开的，但其他 CPU 进不来
+   - **Softirq**：各 CPU 独立处理自己的 pending 位图，**完全无锁并行**。`handle_softirqs()` 先将位图清空（快照），再遍历处理，执行完后重新读取 pending——如果 handler 执行期间同类型 softirq 又被触发（如新网络中断调了 `__raise_softirq_irqoff(NET_RX`），会在下一轮 restart 或 ksoftirqd 中处理，不会在当前 handler 中间嵌套重入
+3. **重启限制**：最多重试 10 次或 2ms，超限后唤醒 ksoftirqd 接管——防止 softirq 占着 CPU 不放导致用户态进程饿死
+
+**ksoftirqd — per-CPU 内核线程兜底**（`kernel/softirq.c` L74-81）：
+
+```c
+DEFINE_PER_CPU(struct task_struct *, ksoftirqd);
+
+static void wakeup_softirqd(void)
+{
+    struct task_struct *tsk = __this_cpu_read(ksoftirqd);
+    if (tsk)
+        wake_up_process(tsk);         /* 唤醒当前 CPU 的 ksoftirqd/N 线程 */
+}
+```
+
+每个 CPU 有一个名为 `ksoftirqd/N`（N=CPU 编号）的内核线程。当 softirq 负载过高（10 次重试都处理不完）或不在中断上下文中触发时，由这个线程来执行剩余的 softirq：
+
+```
+ksoftirqd/N 线程的主循环：
+  ksoftirqd_run_begin()     → 标记入 softirq context
+  handle_softirqs(true)     → 处理 pending 的 softirq
+  ksoftirqd_run_end()       → 退出 softirq context
+  schedule()                → 让出 CPU 给其他进程
+```
+
+因为 ksoftirqd 运行在进程上下文中，它可以被调度——如果 softirq 做不完，下次时间片到了继续做。这样就不会像 BH 那样只要还有 pending 就卡在中断返回路径上不走。
+
+**Softirq 的 10 个向量**（当前 v6.6.78 `include/linux/interrupt.h` L550）：
+
+```c
+enum {
+    HI_SOFTIRQ = 0,         /* 高优先级 tasklet */
+    TIMER_SOFTIRQ,          /* 定时器回调 */
+    NET_TX_SOFTIRQ,         /* 网络发包完成 */
+    NET_RX_SOFTIRQ,         /* 网络收包 */
+    BLOCK_SOFTIRQ,          /* 块设备 I/O 完成 */
+    IRQ_POLL_SOFTIRQ,       /* 中断驱动的轮询（NAPI 相关） */
+    TASKLET_SOFTIRQ,        /* 普通 tasklet */
+    SCHED_SOFTIRQ,          /* 调度器负载均衡 */
+    HRTIMER_SOFTIRQ,        /* 高精度定时器到期 */
+    RCU_SOFTIRQ,            /* RCU 回调处理 */
+    NR_SOFTIRQS             /* = 10 */
+};
+```
+
+以典型的网络收包路径为例，展示完整的 softirq 触发和处理流程：
+
+```
+网卡硬件中断
+  → 顶半部（关 IRQ，极短）
+      → napi_schedule() → __raise_softirq_irqoff(NET_RX_SOFTIRQ)  ← 只设一个 bit
+      → 返回
+  → irq_exit_rcu()
+      → invoke_softirq()
+          → __do_softirq()
+              → handle_softirqs(false)
+                  → local_irq_enable()                              ← 打开 IRQ！
+                  → softirq_vec[NET_RX_SOFTIRQ].action() 即 net_rx_action()
+                      → 从 ring buffer 批量收包
+                      → 协议栈处理（IP → TCP/UDP）
+                      → wake up 用户态 socket 等待进程
+                  → 检查是否还有 pending
+                  → 没有 → 返回
+```
+
+这个路径的关键改进：**整个收包过程（从驱动到协议栈）都在 IRQ 打开下执行**。BH 时代这个过程是 IRQ 关闭的，UART FIFO 满覆盖的问题在 softirq 中被彻底消除。
+
+**总结 softirq 相对 BH 的核心改进**：
+
+1. **每 CPU pending 位图** → 消除了 `global_bh_lock`，SMP 性能大幅提升
+2. **IRQ 打开执行** → 不再有"关 IRQ 丢中断"的风险
+3. **ksoftirqd 兜底** → softirq 不限制死 CPU，高负载下能优雅降级
+4. **ffs 优先级** → 编号越小优先级越高，比 BH 的 fls 更直观（和硬件中断优先级编号习惯一致）
+
+但 softirq 也有一个重要约束：**同一个 softirq 在同一个 CPU 上不会嵌套执行**。防重入的机制在 `__irq_exit_rcu` 中的 `!in_interrupt()` 检查：
+
+```c
+static void __irq_exit_rcu(void)
+{
+    if (!in_interrupt() && local_softirq_pending())
+        invoke_softirq();
+}
+```
+
+当 CPU 0 正在 `handle_softirqs()` 中执行 `net_rx_action` 时，`preempt_count` 中设置了 `SOFTIRQ_OFFSET`，`in_interrupt()` 返回 true。此时新网络中断的顶半部处理完后调用 `irq_exit`，因为 `in_interrupt()` 为 true，会**跳过** `invoke_softirq`，直接返回到被中断的 `net_rx_action` 中。新触发的中断只设置了 pending bit，等当前这轮处理完后下轮 restart 再处理。
+
+这意味着 **softirq 没有重入问题（同 CPU 不嵌套），但有并发问题（多核并行）**。解决并发问题的策略就是 ANK 原则的前两条：用 per-CPU 数据避免共享，必须共享时用锁保护。这正是 ***No shared variables, all the data are CPU local*** 原则的体现。
+
+### 3.3 Tasklet — 基于 Softirq 的简化封装
+
+Tasklet 是 softirq 之上的简化封装，解决 softirq 的一个痛点：softirq 必须在编译时静态注册（在 `enum` 里加一项），驱动无法动态创建新的下半部。
+
+另一个区别在于并发模型的选择：softirq 的同一个 handler 可以在多个 CPU 上同时执行——这对网络、块设备等高性能子系统是优势，但驱动开发者需要为共享数据做保护。Tasklet 选择了相反的模型：通过 `tasklet_trylock(RUN)` 保证同一个 tasklet 实例不会被两个 CPU 同时执行。这么设计的出发点是因为 tasklet 的目标用户是普通驱动（如 GPIO 按键、I2C 消息），这类场景不需要多核并行，开发便利性更重要
+
+**设计思路**：用两个 softirq 向量（`TASKLET_SOFTIRQ` 和 `HI_SOFTIRQ`）来调度一个 per-CPU 链表，驱动只需向链表中添加节点，无需关心并发细节：
+
+```
+TASKLET_SOFTIRQ 软中断 handler → tasklet_action()
+  → 遍历当前 CPU 的 tasklet_vec 链表
+    → 对每个节点执行回调函数
+    → tasklet_trylock(RUN bit) 保证同实例不并行
+```
+
+**核心串行化机制**：每个 tasklet 实例的 `state` 字段有两个标记位——`SCHED`（已入队）和 `RUN`（正在执行）。两者的配合方式如下：
+
+```
+CPU 0                                   CPU 1
+────                                    ────
+tasklet_schedule(t)
+  test_and_set_bit(SCHED) → 0→1 (成功)
+  入队 + raise TASKLET_SOFTIRQ
+                                        tasklet_schedule(t)
+                                          test_and_set_bit(SCHED)
+                                          → 已经是 1（失败，跳过）
+                                          → 同一个 tasklet 不会重复入队
+
+[软中断处理]
+tasklet_action_common():
+  摘下链表 → 遍历 → 遇到 t
+  tasklet_trylock(t):
+    test_and_set_bit(RUN) → 0→1 (成功)
+  清除 SCHED → 执行 t->func()
+                                          [另一个 CPU 尝试调度 t]
+                                          tasklet_schedule(t)
+                                            test_and_set_bit(SCHED) → 0→1 (成功)
+                                            入队
+                                          [同 CPU 的软中断处理]
+                                          tasklet_action_common():
+                                            遇到 t
+                                            tasklet_trylock(t):
+                                              test_and_set_bit(RUN)
+                                              → 还是 1（CPU 0 没释放）
+                                              → 失败！
+                                            重新入队 + 再触发 softirq
+
+  t->func() 返回
+  tasklet_unlock(t):
+    clear_bit(RUN)
+                                          [下次 softirq 处理]
+                                          tasklet_trylock(RUN) → 1→0 后成功
+                                          执行 t->func()
+```
+
+关键点：如果 `RUN` 竞争失败，当前 CPU 不是自旋等待（不像 spinlock），而是**重新入队 + 触发 softirq 下次再试**。这样不会浪费 CPU 时间，也给了另一个 CPU 上的 tasklet 完成执行的机会。
+
+**Tasklet 与 Softirq 的对比**：
 
 | | Softirq | Tasklet |
-|---|---|---|
+|--|---------|---------|
 | 注册方式 | 编译时静态 | 运行时动态 |
-| 同一个 handler 可以并行吗 | 可（多 CPU 同时执行） | 不可（同一类型串行） |
-| 使用难度 | 高（需自己处理并发） | 低（内核保证串行） |
-| 典型用户 | 网络(NET_RX)、块设备(BLOCK) | GPIO 按键、I2C 消息处理 |
+| 并发模型 | 多核并行 | 同实例串行（`tasklet_trylock`） |
+| 性能 | 高（无额外同步） | 稍低（原子操作开销） |
+
+**演进地位**：Tasklet 是 BH → Softirq 路线上的中间产物——它保留了 softirq 的不可睡眠约束（运行在 softirq context），但提供了运行时动态注册能力。下一个机制 workqueue 将彻底解决"不可睡眠"这个根本限制。
 
 ### 3.4 Workqueue — v2.5 引入 → v3.2 CMWQ 重写
 
-Workqueue 与 tasklet 的最大区别是：**tasklet 在 softirq 上下文中执行（不可睡眠），workqueue 在进程上下文（可睡眠）**。
+Workqueue 与 tasklet 的最大区别是可睡眠能力：**tasklet 在 softirq 上下文中执行（不可睡眠），workqueue 在进程上下文（可睡眠）**。驱动中那些需要等待 I/O、申请内存、拿 mutex 的操作，只能用 workqueue 完成。
 
-**原始 workqueue（v2.5 ~ v3.1）**：
+#### 原始 workqueue（v2.5 ~ v3.1）——一个队列一个线程
 
-每个 workqueue 对应一个内核线程（`events/N`），线程从队列中取出 work 执行。问题是：所有 work 共享一个线程池，一个 work 阻塞会影响其他 work。
-
-**CMWQ（Concurrency Managed Workqueue）— v3.2 由 Tejun Heo 重写**：
-
-CMWQ 的核心思想是**将"工作队列"和"工作线程"解耦**：
+最早的 workqueue 设计很简单：每个 workqueue 有自己的内核线程，线程从队列中取 work 依次执行。
 
 ```
-workqueue_struct              ← 对外接口（每个子系统一个）
-    ↓ queue_work()
-pool_workqueue (pwq)          ← 从 workqueue 到线程池的桥接
-    ↓
-worker_pool                   ← 线程池（per-CPU 或 unbound）
-    ├── worker                 ← 实际干活的内核线程
-    ├── worker
-    └── ...
+workqueue_a → 内核线程 events/0 → work1 → work2 → [work3 阻塞了] → ...（后面全等）
+workqueue_b → 内核线程 events/1 → work4 → work5 → work6 → ...
 ```
 
-CMWQ 的关键设计：
+问题一：**相互阻塞**。work1 调用 `msleep(100)` 或等某个 mutex，同一个队列里的 work2、work3 全被堵住。
 
-- **`system_wq`**：标准共享队列，适合大部分 work（`schedule_work()` 默认使用）
-- **`system_highpri_wq`**：高优先级队列
-- **`system_unbound_wq`**：非绑定队列（work 可在任意 CPU 上执行）
-- **`alloc_workqueue()`**：创建专用队列，可设置 WQ_UNBOUND / WQ_HIGHPRI / WQ_FREEZABLE 等标志
+问题二：**线程浪费**。`events/N` 线程池固定创建 `NR_CPUS` 个线程（通常是 4 或 8）。但实际只有少数几个 work 同时在跑，多余的线程占着栈空间（每个内核线程至少 4KB 栈）什么都不做。
 
-v6.6.78 内核中预定义的 7 个全局 workqueue（`kernel/workqueue.c` L423-435）：
+#### v3.2 CMWQ——将"队列"和"线程池"解耦
+
+Tejun Heo 的思路是区分两个概念：
+
+- **`workqueue_struct`**：你创建的"工作队列"，是对外接口。内核有 300 多个子系统各自创建了自己的 workqueue
+- **`worker_pool`**：实际干活的线程池。系统只有少数几个 pool（每个 CPU 两个：普通优先级 + 高优先级）
+
+一个 workqueue 不拥有自己的线程，而是通过 `pool_workqueue` 这个桥接结构，**借用**线程池里的 worker 来执行 work：
+
+```
+驱动 A 调用               驱动 B 调用
+queue_work(wq_a, ...)     queue_work(wq_b, ...)
+       │                         │
+       ▼                         ▼
+   wq_a ──── pwq ────┐      wq_b ──── pwq ────┐
+                     │                        │
+                     ▼                        ▼
+               worker_pool[CPU0]          worker_pool[CPU1]
+               ├── worker                 ├── worker
+               ├── worker                 ├── worker
+               └── ...                    └── ...
+```
+
+这样设计的好处：
+
+1. **线程复用**：300 个 workqueue 不再需要 300 个线程，全部共享 per-CPU 的 pool（每个 CPU 只有 2 个 pool：普通 + 高优先级）。系统只创建真正需要的 worker 数量
+
+2. **并发管理（Concurrency Managed）**：pool 根据当前正在执行的 work 数量自动调整 worker 数量。如果一个 work 阻塞了，pool 检测到活跃 worker 减少，会创建新的 worker 来接替——这样阻塞不会卡住整个队列
+
+3. **work 和线程解耦**：驱动 A 的 work 阻塞了，只阻塞它借用的那个 worker。pool 中的其他 worker 可以继续执行其他 workqueue 的任务
+
+#### 实际如何使用
+
+对于大多数驱动而言，最常用的方式是用内核预定义的共享 workqueue：
+
+```c
+/* 最常用：借用 system_wq */
+schedule_work(&my_work);          /* ≡ queue_work(system_wq, &my_work) */
+schedule_delayed_work(&my_dwork, delay);  /* 延迟执行 */
+
+/* 性能关键或需要隔离：创建专用 workqueue */
+static struct workqueue_struct *my_wq;
+my_wq = alloc_workqueue("my_driver", WQ_UNBOUND | WQ_HIGHPRI, 0);
+queue_work(my_wq, &my_work);
+```
+
+v6.6.78 内核预定义了 7 个全局 workqueue（`kernel/workqueue.c` L423-435）：
 
 ```c
 struct workqueue_struct *system_wq __read_mostly;
@@ -593,6 +1048,20 @@ struct workqueue_struct *system_freezable_wq __read_mostly;
 struct workqueue_struct *system_power_efficient_wq __read_mostly;
 struct workqueue_struct *system_freezable_power_efficient_wq __read_mostly;
 ```
+
+它们的含义和对应的快捷调度函数：
+
+| workqueue | 快捷调度函数 | 场景 |
+|-----------|-----------|------|
+| `system_wq` | `schedule_work()` | 通用短 work，80% 的情况用这个 |
+| `system_highpri_wq` | `schedule_work_highpri()` | 需要低延迟执行（如音频） |
+| `system_long_wq` | `schedule_long_work()` | 执行时间可能很长（如固件加载） |
+| `system_unbound_wq` | `schedule_unbound_work()` | 不绑定固定 CPU，可跨核心迁移 |
+| `system_freezable_wq` | `schedule_freezable_work()` | 系统休眠时自动暂停 |
+| `system_power_efficient_wq` | 无 | 省电优先，不紧急 |
+| `system_freezable_power_efficient_wq` | 无 | 休眠暂停 + 省电 |
+
+大部分驱动只需要 `schedule_work()`，由 `system_wq` 承接。只有特殊需求才需要选其他队列或自己 `alloc_workqueue()`。
 
 ### 3.5 线程化 IRQ — v2.6.30 引入
 
@@ -649,89 +1118,96 @@ void __irq_wake_thread(struct irq_desc *desc, struct irqaction *action)
 
 ```
 顶半部处理完毕
-     │
-     ├─ 需要立刻再次触发中断？→ ThREADED IRQ（handler 返回 IRQ_WAKE_THREAD）
-     │
-     ├─ 需要睡眠（mutex、copy_to_user）？→ Workqueue
-     │    ├─ 偶尔执行 → schedule_work()（用 system_wq）
-     │    └─ 频繁执行 → alloc_workqueue(name, 0, 0) 创建专用队列
-     │
-     ├─ 不可睡眠，耗时短？→ Tasklet
-     │    ├─ DECLARE_TASKLET(name, fn)
-     │    └─ tasklet_schedule(&name)
-     │
-     └─ 不可睡眠，性能密集型 → Softirq（直接注册）
-          └─ open_softirq(NET_RX_SOFTIRQ, handler);
-               raise_softirq(NET_RX_SOFTIRQ);
+    │
+    ├─ 需要睡眠（mutex、I2C 通信、copy_to_user）？
+    │    ├─ Threaded IRQ（handler 返回 IRQ_WAKE_THREAD）
+    │    │    每个中断有独立的内核线程，优先级高、响应快
+    │    │    适合每次中断都要处理固定逻辑（如 GPIO 按键上报）
+    │    │
+    │    └─ Workqueue（schedule_work）
+    │         借用共享线程池（system_wq），和其他驱动共用 worker
+    │         适合非紧急、零散的任务
+    │
+    ├─ 不可睡眠，耗时短？→ Tasklet（tasklet_schedule）
+    │    └─ 面向普通驱动，运行时动态注册
+    │
+    └─ 不可睡眠，性能密集型？→ Softirq（open_softirq + raise_softirq）
+         └─ 面向网络、块设备等高性能子系统，编译时静态注册
 ```
 
-在 STM32MP257 的中断路径中，**你实测的 GPIO 按键中断使用的是哪种下半部**？查一下 `gpio-keys` 驱动的实现就会发现：它使用 `input_event()` 上报给 input 子系统，最终在 `TASKLET_SOFTIRQ` 的上下文中完成事件的分发——tasklet 是中断到用户态之间的关键桥梁。
+**Threaded IRQ vs Workqueue**：Threaded IRQ 的中断线程是每个中断独立创建的（`request_threaded_irq` 时框架自动创建），命名 `irq/N-name`，优先级高，适合中断处理有确定性延迟要求的场景。Workqueue 的 worker 是共享的，适合不紧急的批处理任务——顶半部先把数据收下来，workqueue 里慢慢处理。**如果拿不准，优先用 Threaded IRQ**——它更简单，`request_threaded_irq(irq, handler, thread_fn, ...)` 一步到位。
 
 ---
 
 ## 4. irq_domain 的诞生（v2.6.38）
 
-### 4.1 问题：中断号不够用了
+### 4.1 问题：多个中断控制器的命名空间冲突
 
 Generic IRQ Layer 定型后，中断使用方式是这样的：
 
 1. 驱动程序调用 `request_irq(irq_number, handler, ...)`，其中 `irq_number` 是一个**全局分配的 Linux IRQ 号**
-2. 内核通过 `irq_desc[irq_number]` 数组查找对应的 `irq_desc`
+2. 内核通过 `irq_desc[irq_number]` 查找对应的 `irq_desc`
 3. 硬件中断触发时，架构代码调用 `generic_handle_irq(irq_number)`
 
-在单一中断控制器（如 x86 的 8259A PIC 或 IO-APIC）的系统中，Linux IRQ 号可以直接对应硬件中断号，或者通过简单的偏移量转换。但**随着设备树（Device Tree）在 PowerPC 上的推广，以及 SoC 内部多重中断控制器的出现，问题暴露了**：
+在单一中断控制器（如 x86 的 8259A PIC 或 IO-APIC）的系统中，这一套能工作——hwirq 可以直接映射到 Linux IRQ 号，因为所有中断源属于同一个控制器。但 **SoC 内部通常有多个中断控制器**，以 STM32MP257 为例：
 
-| 场景 | 问题 |
-|------|------|
-| GPIO 控制器作为中断控制器 | 32 个 GPIO 引脚映射到 30 个 Linux 中断号 |
-| SoC 内部多个中断控制器 | 每个控制器的 hwirq 空间从 0 开始，冲突 |
-| 设备树中断描述 | 需要一种方式将 `interrupts = <&gpio 5 IRQ_TYPE_EDGE_BOTH>` 翻译为 Linux IRQ 号 |
+- GICv3：SPI 空间 hwirq=32~1019
+- EXTI：hwirq=0~79（外部中断线）
+- GPIOA~GPIOZ 每个 16 个引脚：各有自己的 hwirq=0~15
 
-**核心矛盾**：硬件用 `(interrupt_controller, hwirq)` 二元组标识一个中断源，而内核需要一个**全局整数** `irq_no`。需要一个映射层解决这个转换。
+**每个控制器都有 hwirq=0**。内核收到中断号 5，它来自 GPIOA 的 PA5 还是 GIC 的 SPI 5？这个问题在单一控制器时代不存在，在多控制器 SoC 上必须解决。
 
-内核文档 `Documentation/core-api/irq/irq-domain.rst` 这样描述：
+**核心矛盾**：硬件用 `(interrupt_controller, hwirq)` 二元组唯一标识中断源，而内核需要一个**全局整数** `virq`。需要一个映射层来完成这次转换。
+
+内核文档对此有一段经典的描述：
 
 > Here the interrupt number loose all kind of correspondence to hardware interrupt numbers: whereas in the past, IRQ numbers could be chosen so they matched the hardware IRQ line into the root interrupt controller, nowadays this number is just a number.
 
-### 4.2 irq_domain 的设计
+> "中断号已经失去了与硬件中断号之间的任何对应关系：过去 IRQ 号可以选到与根中断控制器的硬件中断线匹配，如今这个数字仅仅是一个数字而已。"
 
-Grant Likely 在 **v2.6.38**（2011 年）合入了 `irq_domain` 框架。它在 `irq_alloc_desc()` 之上增加了一层 `hwirq → Linux IRQ` 的映射：
+### 4.2 irq_domain 的设计——`(controller, hwirq)` → `virq`
+
+Grant Likely 在 **v2.6.38**（2011 年）合入了 `irq_domain` 框架。它的本质是一张**映射表**：将一个 `(irq_domain, hwirq)` 的组合映射到一个全局唯一的 Linux 中断号（virq）。
+
+以 STM32MP257 为例，映射完成后 `irq_desc` 中记录的信息：
 
 ```
-设备树: interrupts = <&gpio 5 IRQ_TYPE_EDGE_BOTH>
-                             │
-                             ▼
-  irq_domain (由 gpio 控制器注册):
-      ops.xlate(hwirq=5)         ← 从 fwspec 解析出 hwirq 和 type
-      irq_create_mapping(domain, hwirq=5)
-          └── irq_alloc_desc()   ← 分配 Linux IRQ 号（假设是 70）
-          └── irq_domain_associate(domain, virq=70, hwirq=5)
-              └── ops.map(domain, virq, hwirq)  ← 设置 irq_desc
-                                                  irq_desc[70].irq_data.hwirq = 5
-                                                  irq_desc[70].irq_data.domain = &gpio_domain
+irq_desc[70]:
+  .irq_data.hwirq  = 5            ← GPIO 控制器侧的 hwirq
+  .irq_data.domain = &gpio_domain ← 属于哪个中断控制器
+  .irq_data.chip   = &stm32_gpio_irq_chip  ← 操作函数表
+  .handle_irq      = handle_fasteoi_irq    ← 流控函数
+  .action          = gpio_keys_handler     ← 驱动注册的 handler
 ```
 
-关键结构体——`struct irq_domain`（`include/linux/irqdomain.h` L150）：
+**映射的全过程**——以 `interrupts = <&gpio 5 IRQ_TYPE_EDGE_BOTH>` 为例：
 
-```c
-struct irq_domain {
-    struct list_head        link;           /* domain 全局链表 */
-    const char              *name;          /* domain 名称（debugfs 显示） */
-    const struct irq_domain_ops *ops;       /* 操作函数表 */
-
-    /* 映射数据 */
-    irq_hw_number_t         hwirq_max;      /* 最大 hwirq 数 */
-    unsigned int            revmap_direct_max_irq;
-    struct radix_tree_root  revmap_tree;    /* radix tree（tree 模式使用） */
-    struct mutex            revmap_mutex;
-    struct fwnode_handle    *fwnode;        /* 关联的设备树 fwnode */
-    void                    *host_data;     /* 驱动私有数据（用于存放 chip_data 指针） */
-    unsigned int            flags;
-
-    /* ← 父 domain（v3.10+ 层级支持，见第 5 节） */
-    struct irq_domain       *parent;
-};
 ```
+设备树: interrupts = <&gpio 5 ...>
+         │
+         ▼
+① 找 domain: irq_find_matching_fwspec(fwspec)
+   从全局 domain 链表里找到 &gpio 注册的 irq_domain
+         │
+         ▼
+② 解析 hwirq: domain->ops->translate(fwspec)
+   从 {5, EDGE_BOTH} 中提取 hwirq=5, type=IRQ_TYPE_EDGE_BOTH
+         │
+         ▼
+③ 分配 virq: irq_create_mapping(domain, hwirq=5)
+   → virq = irq_alloc_desc()       ← 从全局 irq_desc 树取出一个空槽
+   → irq_desc[virq].irq_data.hwirq = 5   ← 记下 hwirq
+   → irq_desc[virq].irq_data.domain = domain  ← 记下属于哪个 domain
+   → domain->ops->map(virq)        ← 给这个 virq 装上 irq_chip 和 handle_irq
+         │
+         ▼
+④ 使用: request_irq(virq, handler, ...)
+   → 硬件中断触发 → generic_handle_irq(virq) → irq_desc[virq].handle_irq()
+```
+
+第 ③ 步最关键：`irq_alloc_desc()` 从全局 `irq_desc` 树中分配一个空 slot，**返回的编号是软件决定的，和硬件 hwirq 没有任何固定关系**。virq=70 只是一个索引，`(gpio_domain, hwirq=5) → virq=70` 的对应关系全靠 irq_domain 维护。这就是内核文档说的：
+
+> "today this number is just a number"
 
 ### 4.3 四种映射方式
 
