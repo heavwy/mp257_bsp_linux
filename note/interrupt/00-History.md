@@ -4,7 +4,7 @@
 >
 > 每个数据结构背后都对应一个真实的历史问题。本文从 Linux v1.0 到 v6.6，沿着中断子系统的关键节点，追溯**每个机制是在解决什么问题**。
 >
-> **字数**：约 12,000 字 · **建议阅读时间**：40~60 分钟
+> **字数**：约 25,000 字 · **建议阅读时间**：60~90 分钟
 
 ---
 
@@ -1167,190 +1167,92 @@ Generic IRQ Layer 定型后，中断使用方式是这样的：
 
 ### 4.2 irq_domain 的设计——`(controller, hwirq)` → `virq`
 
-Grant Likely 在 **v2.6.38**（2011 年）合入了 `irq_domain` 框架。它的本质是一张**映射表**：将一个 `(irq_domain, hwirq)` 的组合映射到一个全局唯一的 Linux 中断号（virq）。
+Grant Likely 在 **v2.6.38**（2011 年）合入了 `irq_domain` 框架。核心思路是新增一层映射，将 `(interrupt_controller, hwirq)` 转为全局 Linux IRQ 号（virq）。
 
-以 STM32MP257 为例，映射完成后 `irq_desc` 中记录的信息：
-
-```
-irq_desc[70]:
-  .irq_data.hwirq  = 5            ← GPIO 控制器侧的 hwirq
-  .irq_data.domain = &gpio_domain ← 属于哪个中断控制器
-  .irq_data.chip   = &stm32_gpio_irq_chip  ← 操作函数表
-  .handle_irq      = handle_fasteoi_irq    ← 流控函数
-  .action          = gpio_keys_handler     ← 驱动注册的 handler
-```
-
-**映射的全过程**——以 `interrupts = <&gpio 5 IRQ_TYPE_EDGE_BOTH>` 为例：
-
-```
-设备树: interrupts = <&gpio 5 ...>
-         │
-         ▼
-① 找 domain: irq_find_matching_fwspec(fwspec)
-   从全局 domain 链表里找到 &gpio 注册的 irq_domain
-         │
-         ▼
-② 解析 hwirq: domain->ops->translate(fwspec)
-   从 {5, EDGE_BOTH} 中提取 hwirq=5, type=IRQ_TYPE_EDGE_BOTH
-         │
-         ▼
-③ 分配 virq: irq_create_mapping(domain, hwirq=5)
-   → virq = irq_alloc_desc()       ← 从全局 irq_desc 树取出一个空槽
-   → irq_desc[virq].irq_data.hwirq = 5   ← 记下 hwirq
-   → irq_desc[virq].irq_data.domain = domain  ← 记下属于哪个 domain
-   → domain->ops->map(virq)        ← 给这个 virq 装上 irq_chip 和 handle_irq
-         │
-         ▼
-④ 使用: request_irq(virq, handler, ...)
-   → 硬件中断触发 → generic_handle_irq(virq) → irq_desc[virq].handle_irq()
-```
-
-第 ③ 步最关键：`irq_alloc_desc()` 从全局 `irq_desc` 树中分配一个空 slot，**返回的编号是软件决定的，和硬件 hwirq 没有任何固定关系**。virq=70 只是一个索引，`(gpio_domain, hwirq=5) → virq=70` 的对应关系全靠 irq_domain 维护。这就是内核文档说的：
-
-> "today this number is just a number"
-
-### 4.3 四种映射方式
-
-irq_domain 提供了四种反向映射方式（`hwirq → virq`）：
-
-| 类型 | 分配函数 | 数据结构 | 查询复杂度 | 适用场景 |
-|------|---------|---------|-----------|---------|
-| **Linear** | `irq_domain_add_linear()` | 固定大小数组 | O(1) | hwirq 范围小且固定的控制器（推荐） |
-| **Tree** | `irq_domain_add_tree()` | radix tree | O(log N) | hwirq 范围大或稀疏的控制器 |
-| **Legacy** | `irq_domain_add_legacy()` | 预分配数组 | O(1) | 旧平台固定 IRQ 映射（已废弃） |
-| **NoMap** | `irq_domain_add_nomap()` | 无映射 | — | 硬件可编程（极少使用） |
-
-**Linear 模式**是绝大多数驱动控制器的选择。它以 hwirq 为索引直接查表，结构简单、延迟确定。v6.6.78 中 STM32MP257 的 pinctrl 驱动正是使用 Linear 模式注册 GPIO 中断。
-
-**Tree 模式**适合 hwirq 空间巨大（如 GICv3 的 SPI 中断可达 1020 个）但实际使用很少的场景，避免为所有可能的 hwirq 预分配条目。
-
-以 **STM32MP257 的 PROCBUS 设备树**（`stm32mp251.dtsi`）为例，中断引用的三种形式都由 irq_domain 解析：
-
-```dts
-/* 形式一：直接引用 GIC SPI — virq 由 GIC domain 分配 */
-&usart2 {
-    interrupts = <GIC_SPI 146 IRQ_TYPE_LEVEL_HIGH>;
-};
-
-/* 形式二：引用 GPIO 中断 — virq 由 GPIO domain 分配，parent 是 EXTI，再 parent 是 GIC */
-&gpioh {
-    interrupts = <5 IRQ_TYPE_EDGE_BOTH>;
-};
-
-/* 形式三：引用 EXTI 唤醒中断 — virq 由 EXTI domain 分配 */
-interrupts-extended = <&exti1 47 IRQ_TYPE_LEVEL_HIGH>;
-```
-
-### 4.4 irq_domain 的初始化顺序
-
-irq_domain 的另一个重要设计是**依赖排序初始化**。中断控制器有层级关系（GIC → EXTI → GPIO），子控制器的 irq_domain 需要父 domain 已存在。
-
-内核的 `drivers/of/irq.c` 中的 `of_irq_init()` 实现了这个排序：
+#### 核心结构体
 
 ```c
-/* v6.6.78 — drivers/of/irq.c */
-void __init of_irq_init(const struct of_device_id *matches)
-{
-    /* 第一阶段：扫描设备树，收集所有 interrupt-controller 节点 */
-    for_each_matching_node_and_match(np, matches, &match) {
-        desc = kzalloc(sizeof(*desc), GFP_KERNEL);
-        desc->irq_init_cb = match->data;         /* 驱动初始化函数 */
-        desc->dev = of_node_get(np);
-        /* 找到该控制器的父节点 */
-        desc->interrupt_parent = of_irq_find_parent(np);
-        list_add_tail(&desc->list, &intc_desc_list);
-    }
-
-    /* 第二阶段：按 parent 依赖排序初始化 */
-    while (!list_empty(&intc_desc_list)) {
-        list_for_each_entry_safe(desc, ...) {
-            if (desc->interrupt_parent != parent)
-                continue;                        /* 爹还没初始化，跳过 */
-            /* 初始化当前控制器（parent=null 的是根 GIC，先初始化） */
-            desc->irq_init_cb(desc->dev, desc->interrupt_parent);
-        }
-        /* 取新初始化的控制器作为下一轮的"父节点" */
-        parent = next->dev;
-    }
-}
+struct irq_domain {
+    const struct irq_domain_ops *ops;   /* 操作函数：翻译 hwirq、映射等 */
+    struct fwnode_handle    *fwnode;    /* 绑定到哪个设备树节点 */
+    void                    *host_data; /* 驱动私有数据 */
+    struct irq_domain       *parent;    /* 父 domain（层级域用） */
+    irq_hw_number_t         hwirq_max;
+    struct radix_tree_root  revmap_tree; /* Tree 模式用 */
+};
 ```
 
-这个"先父亲后儿子"的初始化策略确保了在 STM32MP257 上：
-1. 先初始化 **GIC（根 domain）**：`gic_of_init()` → 创建 GIC irq_domain
-2. 再初始化 **EXTI（子 domain）**：`stm32mp_exti_probe()` → `irq_domain_add_hierarchy(gic_domain, ...)`
-3. 最后初始化 **Pinctrl/GPIO**：注册 Linear domain，parent 指向 EXTI domain
+#### 映射过程
 
-这正是你实测 `/sys/kernel/debug/irq/irqs/70` 看到的三层 domain 拓扑：
+以设备树 `interrupts = <&gpio 5 IRQ_TYPE_EDGE_BOTH>` 为例：
 
 ```
-domain: :soc@0:pinctrl@44240000-0   ← GPIO domain (leaf)
-  parent: :soc@0:intc@44220000       ← EXTI domain (middle)
-    parent: :intc@4ac00000           ← GIC domain (root)
+设备树描述 → irq_domain 查找 → 翻译 hwirq
+  → irq_alloc_desc() 从全局 irq_desc 树中分配一个空 virq
+  → irq_desc[virq].irq_data.hwirq = hwirq
+  → irq_desc[virq].irq_data.domain = domain
+  → domain->ops->map() 设置 irq_chip 等
 ```
+
+`irq_alloc_desc()` 是自动分配编号的，virq 与 hwirq 之间没有固定对应关系。`(gpio_domain, hwirq=5)` → `virq=70` 的映射完全由 irq_domain 维护。
+
+### 4.3 四种反向映射方式
+
+硬件中断触发时，内核需要由 hwirq 快速找到 virq。根据控制器的特点选择不同方式：
+
+| 模式 | 数据结构 | 适用场景 |
+|------|---------|---------|
+| **Linear** | 固定数组 `revmap[hwirq] = virq` | hwirq 连续且数量不大（如 GPIO 的 16 个引脚） |
+| **Tree** | radix tree | hwirq 空间大但使用稀疏（如 GICv3 SPI 可达 1020） |
+| **Legacy** | 预分配固定数组 | 旧平台兼容（已废弃） |
+| **NoMap** | 无映射（hwirq = virq） | 极少使用 |
+
+Linear 以 hwirq 为下标直接查数组，O(1)，STM32MP257 的 pinctrl 就是用的 Linear。GIC 用 Tree，因为 SPI 空间大（0~1019）但实际只用其中一部分，没必要预分配全部数组。
+
+### 4.4 irq_domain 的历史意义
+
+irq_domain 解决了一个根本问题：**将 Linux IRQ 号与硬件中断号解耦**。在此之前，驱动里硬编码中断号是常态，改用设备树后，中断描述从"写死整型"变成了 `(controller_phandle, hwirq)` 二元组，驱动不再关心自己拿到的是几号 IRQ。
+
+这个解耦带来的三个直接变化：
+
+1. **驱动可移植**：同一份驱动代码在不同 SoC 上编译，不需要改中断号
+2. **多控制器共存**：每个控制器有自己的 domain，hwirq=0 在各 domain 内独立解析，不再冲突
+3. **为层级域铺路**：irq_domain 的 `parent` 指针在 v3.10 后被复用，实现了 GIC→EXTI→GPIO 这样的多层中断路径——这正是下一章的主题
 
 ---
 
-## 5. 从链式到层级：中断控制器的两种级联方案（v3.0+）
+## 5. 中断控制器级联：链式与层级域
 
-### 5.1 链式（Chained）—— 老方案
+irq_domain 框架落地后，开发者很快遇到了一个新问题：**当系统中存在多个中断控制器时，它们之间的级联关系如何用软件表达？** 硬件上有两种连接方式，对应了两种软件方案。链式方案最先出现（解决多对一），层级域后来补充（解决一对一）。
 
-在多级中断控制器出现之前，中断控制器之间最常见的连接方式就是"链式"。它的硬件特征是**多对一**：子控制器的多个中断输出，汇总到父控制器的一个中断输入。
+### 5.1 链式（Chained）—— 多对一拓扑
 
-以 GPIO 中断为例：
+最早的级联方案。硬件特征是**子控制器的多个中断信号共享父控制器的一个中断输入**。以 GPIO 直接接 GIC 为例——GPIO 的 16 个引脚共用一个 GIC SPI：
 
 ```
 GPIO 引脚 0 ─┐
 GPIO 引脚 1 ─┤
-GPIO 引脚 2 ─┤──→ GIC SPI 33 号
+GPIO 引脚 2 ─┤──→ GIC SPI 33（共享）
 GPIO 引脚 3 ─┘
 ```
 
-在链式方案中，需要两个 irq_desc：
-- `irq_desc[17]` 对应 GIC SPI 33 号（父中断）
-- `irq_desc[100~103]` 对应 GPIO 的 4 个引脚（子中断）
+这种连接方式在嵌入式 SoC 中很常见，因为 GIC 的 SPI 是有限资源。处理中断时，GIC SPI 33 的 handler 不是直接调设备 action，而是**手动分发**——读 GPIO 寄存器区分是哪个引脚触发了，再调对应子中断：
 
-处理流程：
-
-```c
-/* GIC 检测到 SPI 33 → virq=17 */
-generic_handle_domain_irq(gic_domain, 33);    /* irq_find_mapping → 17 */
-    → irq_desc[17].handle_irq                 /* → gic_handle_cascade_irq() */
-
-        /* GIC 驱动内的级联处理函数 */
-        gic_handle_cascade_irq(desc):
-            mask_ack_irq(desc)                  /* 屏蔽 SPI 33 */
-            chip = irq_data_get_irq_chip(desc);
-            /* 调用 GPIO 驱动注册的 handler → 读 GPIO 寄存器 */
-            generic_handle_irq(virq=102);       /* 细分中断源 */
-            chip->irq_unmask(desc);              /* 解屏蔽 SPI 33 */
+```
+GIC SPI 33 触发
+  → 链式 handler 运行（取代常规的 action handler）
+  → 读 GPIO 中断状态寄存器
+  → 发现引脚 2 触发了
+  → generic_handle_irq(gpio_pin_2_virq)
 ```
 
-链式方案的关键特征：
-- **2 个 irq_desc**：父级一个、子级一群
-- **父级 handler 做分发**：GIC SPI 33 的 handler 不是去调用设备的 action，而是去读 GPIO 寄存器，再调用子中断的 handler
-- **`irq_set_chained_handler_and_data()`** 注册：专门用于链式场景，不创建 action，直接替换 handler
+链式方案通过 `irq_set_chained_handler_and_data()` 注册，不创建 action，用自定义 handler 覆盖了父中断的整个处理流程。
 
-GIC 驱动中的 `gic_cascade_irq()` 就是典型实现（`irq-gic.c` L419）：
+### 5.2 层级域（Hierarchy）—— 一对一拓扑
 
-```c
-void __init gic_cascade_irq(unsigned int gic_nr, unsigned int irq)
-{
-    irq_set_chained_handler_and_data(irq, gic_handle_cascade_irq,
-                                     &gic_data[gic_nr]);
-}
-```
+硬件设计的演进催生了另一种级联场景：**子控制器的每个中断源都有独立的父控制器中断线**。
 
-链式的局限：
-- **父中断不可被其他设备共享**（已经被级联 handler 独占）
-- **需要额外软件分发**（读 GPIO 寄存器区分来源），增加延迟
-- **嵌套层级越多，软件开销越大**（每层都要手动分发）
-- **扩展性差**（GPIO 每增加一个中断引脚，不需要改 GIC 配置，但分发逻辑变复杂）
-
-### 5.2 层级（Hierarchy）—— 新方案
-
-层级方案的前提是：**子控制器的每个中断在父控制器中有独立的中断线**（一对一映射）。
-
-对于 STM32MP257 的 EXTI+GIC 组合，硬件连接是：
+以 STM32MP257 的 EXTI + GIC 为例——EXTI event 0~47 各占一个 GIC SPI：
 
 ```
 EXTI event 0  →  GIC SPI 268
@@ -1359,358 +1261,43 @@ EXTI event 1  →  GIC SPI 269
 EXTI event 47 →  GIC SPI 315
 ```
 
-每个 EXTI event 有**独立的 GIC SPI**，不需要软件分发。EXTI 控制器的作用是边沿检测、触发类型选择、唤醒管理——而不是"分辨谁触发了中断"。
-
-流程完全不同：
+这里每个 EXTI event 有独立的 SPI，不需要软件分发。但 EXTI 本身是**功能性控制器**——它要做边沿检测、触发类型选择、唤醒管理。所以 mask 一个中断时，EXTI 驱动操作完自己的 IMR 寄存器后，还需要递归调用 GIC 的 mask 函数。层级域将这个"递归操作"抽象为 `irq_domain->parent` 指针和 `irq_chip_*_parent()` 系列函数。
 
 ```
-request_irq(virq=70, handler)
-    → irq_domain_alloc_irqs(gpio_domain, hwirq=5)
-        → gpio_domain.alloc(virq=70, hwirq=5)    ← 设置 chip_data
-        → irq_domain_alloc_irqs_parent()          ← 递归
-            → exti_domain.alloc(virq=70, hwirq=5) ← 设置 chip_data
-            → irq_domain_alloc_irqs_parent()       ← 递归
-                → gic_domain.alloc(virq=70, hwirq=305)
-                                                    ← 写入 GICD_ISENABLER
+virq 的 mask 操作：
+  → exti_chip->irq_mask(data)        ← EXTI 写 IMR 寄存器
+  → irq_chip_mask_parent(data)       ← 递归到父级
+      → gic_chip->irq_mask(data)     ← GIC 写 GICD_ICENABLER
 ```
 
-处理中断时：
+层级域不是用来替代链式的——它解决的是**链式无法处理的问题**：当中间层控制器需要参与每一级硬件操作时，链式的"父 handler 手动分发"无法满足递归操作的需求。
 
-```c
-GIC 检测到 SPI 305 → virq=70
-generic_handle_domain_irq(gic_domain, 305);    /* 直接找到 virq=70 */
-    → irq_desc[70].handle_irq                   /* → handle_fasteoi_irq */
-        → irq_desc[70].chip->irq_mask           /* → stm32mp_exti_mask → 
-                                                    写 IMR 寄存器 + 
-                                                    irq_chip_mask_parent()
-                                                    → gic_mask_irq */
-        → handle_irq_event(desc)                /* → action->handler */
-        → irq_desc[70].chip->irq_unmask         /* → stm32mp_exti_unmask */
-        → irq_desc[70].chip->irq_eoi            /* → stm32mp_exti_eoi →
-                                                    写 RPR/FPR +
-                                                    irq_chip_eoi_parent()
-                                                    → gic_eoi_irq */
-```
+### 两种方案对比
 
-层级方案的关键特征：
-
-| 特性 | 链式 (Chained) | 层级 (Hierarchy) |
-|------|---------------|-----------------|
-| irq_desc 数量 | 父 1 + 子 N = N+1 | 子 N（共享父的 desc） |
-| 分发方式 | handler 手动读寄存器分发 | irq_chip 递归调用父级 |
-| 父中断是否可共享 | 否 | 是（每个子中断有独立 SPI） |
-| 硬件要求 | 多对一 | 一对一 |
-| 软件开销 | 每层 handler 调用 | 函数指针递归 |
-| 典型实现 | `gic_cascade_irq()` | EXTI `irq_domain_add_hierarchy()` |
-
-### 5.3 层级域的内核实现
-
-层级域的核心是 `irq_domain_create_hierarchy()`（`kernel/irq/irqdomain.c` L1130）：
-
-```c
-struct irq_domain *irq_domain_create_hierarchy(struct irq_domain *parent,
-                                               unsigned int flags,
-                                               unsigned int size,
-                                               struct fwnode_handle *fwnode,
-                                               const struct irq_domain_ops *ops,
-                                               void *host_data)
-{
-    struct irq_domain *domain;
-
-    domain = __irq_domain_create(fwnode, size, size, 0, ops, host_data);
-    if (domain) {
-        domain->parent = parent;        /* ← 关键：记录父 domain */
-        ...
-        __irq_domain_publish(domain);
-    }
-    return domain;
-}
-```
-
-当子 domain 的 `alloc()` 中调用 `irq_domain_alloc_irqs_parent()` 时，它递归进入父 domain：
-
-```c
-int irq_domain_alloc_irqs_parent(struct irq_domain *domain,
-                                 unsigned int irq_base, unsigned int nr_irqs,
-                                 void *arg)
-{
-    if (!domain->parent)
-        return -ENOSYS;
-    /* 递归到父 domain 的 alloc */
-    return irq_domain_alloc_irqs_hierarchy(domain->parent, irq_base,
-                                           nr_irqs, arg);
-}
-```
-
-**STM32MP257 的 EXTI 正是使用层级域**（`irq-stm32mp-exti.c` L836 probe 中）：
-
-```c
-/* 创建层级 domain，parent 指向 GIC domain */
-domain = irq_domain_add_hierarchy(parent_domain, 0,
-                                  bank_nr * 32,
-                                  np, &stm32mp_exti_domain_ops,
-                                  host_data);
-```
-
-而 EXTI domain ops 的 `alloc()` 在设置好自身 chip_data 后，调用 `irq_domain_alloc_irqs_parent()` 让 GIC 完成剩余工作（`irq-stm32mp-exti.c` L677）。
-
-**irq_chip 的递归调用**：层级域下，mask/unmask/eoi 等操作也需要递归到父级。EXTI 驱动的 irq_chip 中使用了 `irq_chip_*_parent()` 系列函数：
-
-```c
-static struct irq_chip stm32mp_exti_chip = {
-    .name          = "stm32mp-exti",
-    .irq_eoi       = stm32mp_exti_eoi,         /* 写 RPR+FPR 清挂起 + 
-                                                   irq_chip_eoi_parent(d) */
-    .irq_mask      = stm32mp_exti_mask,         /* 写 IMR + 
-                                                   irq_chip_mask_parent(d) */
-    .irq_unmask    = stm32mp_exti_unmask,       /* 写 IMR + 
-                                                   irq_chip_unmask_parent(d) */
-    .irq_set_type  = stm32mp_exti_set_type,     /* 写 RTSR/FTSR */
-    .irq_set_wake  = stm32mp_exti_set_wake,     /* 标记唤醒源 +
-                                                   irq_chip_set_wake_parent(d) */
-    .irq_ack       = irq_chip_ack_parent,       /* 直通 GIC */
-};
-```
-
-其中 `irq_chip_eoi_parent()` 等函数的实现就是通过 `irq_data->parent_data` 找到父级的 irq_chip 并调用对应函数——这就是"层级"的本质：**每个操作可以穿透到父级，形成一条完整的硬件操作链**。
+| | 链式（Chained） | 层级域（Hierarchy） |
+|--|---------------|-----------------|
+| 硬件连接 | 多对一（共享一个父中断） | 一对一（各占独立父中断） |
+| 软件分发 | 手动读寄存器 | 不需要（硬件已决定） |
+| 操作递归 | 不需要 | 需要（mask/eoi 逐层传递） |
+| 资源消耗 | 省父中断 | 耗父中断 |
+| 典型场景 | GPIO 直连 GIC | EXTI 在 GPIO 和 GIC 之间 |
 
 ---
 
-## 6. ARM64 中断入口（v3.11+）
+## 结语：中断子系统的设计哲学
 
-### 6.1 ARM64 在 Linux 中的支持
+回顾 30 年演进史，Linux 中断子系统的每一个核心机制都对应一个明确的历史问题：
 
-ARM64（AArch64）架构从 Linux **v3.7**（2012 年 10 月）开始获得官方支持。与 ARM32 不同，ARM64 的中断入口完全重写——使用 `VBAR_EL1` 寄存器定位异常向量表，由 `entry.S` 中的 `vectors` 符号定义。
+| 机制 | 解决的问题 | 引入版本 |
+|------|-----------|---------|
+| **BH** | 顶半部必须快，耗时工作推迟 | v2.1 |
+| **irq_chip + 流控函数** | `__do_IRQ()` 把流控和硬件操作混在一起 | v2.6.18 |
+| **Softirq** | BH 的 `global_bh_lock` 导致 SMP 扩展性差 | v2.3 重写 |
+| **Tasklet** | Softirq 静态注册，驱动无法动态创建 | v2.4 |
+| **Workqueue** | Softirq/Tasklet 不可睡眠 | v2.5 |
+| **Threaded IRQ** | 为每个中断创建专用内核线程，简化驱动开发 | v2.6.30 |
+| **irq_domain** | 多控制器时代 hwirq 命名空间冲突 | v2.6.38 |
+| **层级域** | 多对一/一对一两种级联拓扑需要不同的软件方案 | v3.10+ |
 
-### 6.2 异常向量表结构
+**一条隐线贯穿始终**：每一次演进都是因为"硬件变复杂了"或"并发要求变高了"，迫使内核将抽象的层次再提高一层。从单一的 `__do_IRQ()` 到可替换的流控函数，从全局的 BH 位图到 per-CPU 的 softirq，从固定的 hwirq→virq 映射到 irq_domain——每一层抽象都让驱动开发者离硬件更远一步，但离"写一次到处跑"的目标也更近一步。
 
-ARM64 的异常向量表由 16 个条目组成，分为 4 组（每组 4 个异常类型），每组的基地址由当前的异常级别（EL）和使用的堆栈指针（SP）决定：
-
-```
-向量表基址 (VBAR_EL1)
-    ├── 第 1 组：EL1, 使用 SP_EL0 (同步/IRQ/FIQ/Error)
-    ├── 第 2 组：EL1, 使用 SP_EL1 ← 内核态中断走这里
-    ├── 第 3 组：EL0, 64 位程序  ← 用户态中断走这里
-    └── 第 4 组：EL0, 32 位程序
-```
-
-每组 4 种异常类型：同步（sync）、普通中断（irq）、快速中断（fiq）、系统错误（error）。
-
-`arch/arm64/kernel/entry.S` 中使用 `kernel_ventry` 宏定义所有 16 个向量：
-
-```asm
-.align 11                     /* 2KB 对齐 — ARM64 硬性要求 */
-SYM_CODE_START(vectors)
-    kernel_ventry  1, t, 64, sync         /* EL1t Synchronous */
-    kernel_ventry  1, t, 64, irq          /* EL1t IRQ */
-    kernel_ventry  1, t, 64, fiq          /* EL1t FIQ */
-    kernel_ventry  1, t, 64, error        /* EL1t Error */
-
-    kernel_ventry  1, h, 64, sync         /* EL1h Synchronous */
-    kernel_ventry  1, h, 64, irq          /* EL1h IRQ  ← 内核态中断入口 */
-    kernel_ventry  1, h, 64, fiq          /* EL1h FIQ */
-    kernel_ventry  1, h, 64, error        /* EL1h Error */
-
-    kernel_ventry  0, t, 64, sync         /* EL0 64-bit Synchronous */
-    kernel_ventry  0, t, 64, irq          /* EL0 64-bit IRQ  ← 用户态中断入口 */
-    kernel_ventry  0, t, 64, fiq          /* EL0 64-bit FIQ */
-    kernel_ventry  0, t, 64, error        /* EL0 64-bit Error */
-
-    kernel_ventry  0, t, 32, sync         /* EL0 32-bit Synchronous */
-    kernel_ventry  0, t, 32, irq          /* EL0 32-bit IRQ */
-    kernel_ventry  0, t, 32, fiq          /* EL0 32-bit FIQ */
-    kernel_ventry  0, t, 32, error        /* EL0 32-bit Error */
-SYM_CODE_END(vectors)
-```
-
-异常向量表的安装时机在 `head.S` 的 `__primary_switched` 函数中：
-
-```asm
-/* arch/arm64/kernel/head.S */
-SYM_FUNC_START_LOCAL(__primary_switched)
-    ...
-    adr_l   x8, vectors            /* 加载向量表地址 */
-    msr vbar_el1, x8               /* 写入 VBAR_EL1 寄存器 */
-    isb                            /* 指令同步屏障，保证立即生效 */
-    ...
-    bl      start_kernel           /* 跳入 C 语言初始化 */
-```
-
-### 6.3 kernel_ventry 宏的工作流程
-
-`kernel_ventry` 宏（`entry.S`）为每个向量条目生成 128 字节的入口代码，该代码：
-
-1. **在栈上分配 `pt_regs` 空间**（约 288 字节，保存 31 个通用寄存器 + 其他上下文）
-2. **检查栈溢出**（通过 `CONFIG_VMAP_STACK` 检测 SP 是否越界）
-3. **跳转到对应的处理函数**（如 `el1h_64_irq`）
-
-以 `kernel_ventry 1, h, 64, irq` 为例，最终跳转到 `el1h_64_irq`。这个函数通过 `entry_handler` 宏定义：
-
-```asm
-/* entry.S: entry_handler 宏扩展为完整函数 */
-SYM_CODE_START_LOCAL(el1h_64_irq)
-    kernel_entry 1, 64             /* 保存所有寄存器到栈上 pt_regs */
-    mov     x0, sp                 /* x0 = regs 指针 */
-    bl      el1h_64_irq_handler    /* 调用 C 函数 */
-    b       ret_to_kernel          /* 恢复寄存器、返回 */
-SYM_CODE_END(el1h_64_irq)
-```
-
-### 6.4 C 层面的处理入口
-
-`el1h_64_irq_handler()` 定义在 `arch/arm64/kernel/entry-common.c` L520：
-
-```c
-asmlinkage void noinstr el1h_64_irq_handler(struct pt_regs *regs)
-{
-    el1_interrupt(regs, handle_arch_irq);   /* ← 传入函数指针 */
-}
-
-static void noinstr el1_interrupt(struct pt_regs *regs,
-                                  void (*handler)(struct pt_regs *))
-{
-    write_sysreg(DAIF_PROCCTX_NOIRQ, daif);  /* 关闭 IRQ（防止嵌套） */
-
-    if (IS_ENABLED(CONFIG_ARM64_PSEUDO_NMI) && !interrupts_enabled(regs))
-        __el1_pnmi(regs, handler);           /* Pseudo-NMI 路径 */
-    else
-        __el1_irq(regs, handler);            /* 标准路径 */
-}
-
-static __always_inline void __el1_irq(struct pt_regs *regs,
-                                      void (*handler)(struct pt_regs *))
-{
-    enter_from_kernel_mode(regs);            /* 记录上下文信息（lockdep/trace） */
-
-    irq_enter_rcu();                         /* 进入中断上下文 */
-    do_interrupt_handler(regs, handler);     /* ← 最终调用 gic_handle_irq */
-    irq_exit_rcu();                          /* ← 退出中断，触发软中断 */
-
-    arm64_preempt_schedule_irq();            /* 检查是否可抢占 */
-    exit_to_kernel_mode(regs);
-}
-```
-
-用户态中断路径类似：`el0t_64_irq` → `el0t_64_irq_handler()` → `__el0_irq_handler_common()` → `el0_interrupt(regs, handle_arch_irq)`。
-
-### 6.5 handle_arch_irq：将架构代码与 GIC 驱动解耦
-
-`handle_arch_irq` 是一个**函数指针**，定义在 `arch/arm64/kernel/irq.c` L100：
-
-```c
-static void default_handle_irq(struct pt_regs *regs)
-{
-    panic("IRQ taken without a root IRQ handler\n");
-}
-
-void (*handle_arch_irq)(struct pt_regs *) __ro_after_init = default_handle_irq;
-
-int __init set_handle_irq(void (*handle_irq)(struct pt_regs *))
-{
-    if (handle_arch_irq != default_handle_irq)
-        return -EBUSY;
-    handle_arch_irq = handle_irq;             /* GIC 驱动调用此函数注册自己 */
-    pr_info("Root IRQ handler: %ps\n", handle_irq);
-    return 0;
-}
-```
-
-GIC 驱动在初始化时（`__gic_init_bases()`）调用 `set_handle_irq(gic_handle_irq)` 将自己注册为根中断处理函数。如果系统中更换了中断控制器（如从 GICv2 换成 GICv3），只需在 GICv3 驱动中调用同样的接口——**架构代码不需要任何修改**。
-
-### 6.6 gic_handle_irq：中断处理主循环
-
-`gic_handle_irq()`（`irq-gic.c` L345）是中断处理的"主循环"：
-
-```c
-static void __exception_irq_entry gic_handle_irq(struct pt_regs *regs)
-{
-    u32 irqstat, irqnr;
-    struct gic_chip_data *gic = &gic_data[0];
-    void __iomem *cpu_base = gic_data_cpu_base(gic);
-
-    do {
-        irqstat = readl_relaxed(cpu_base + GIC_CPU_INTACK);  /* 读 GICC_IAR */
-        irqnr = irqstat & GICC_IAR_INT_ID_MASK;              /* 获取中断 ID */
-
-        if (unlikely(irqnr >= 1020))
-            break;              /* ID 1020-1023 是伪中断(spurious)，结束循环 */
-
-        /* 如果硬件支持 split EOI/Deactivate，立即写 EOI */
-        if (static_branch_likely(&supports_deactivate_key))
-            writel_relaxed(irqstat, cpu_base + GIC_CPU_EOI);
-
-        /* SGI (IPI) 需要处理源 CPU 信息 */
-        if (irqnr <= 15) {
-            /* ... 保存 SGI 源 CPU 信息 ... */
-        }
-
-        generic_handle_domain_irq(gic->domain, irqnr);  /* hwirq → virq → handler */
-    } while (1);                    /* 循环直到所有待处理中断完成 */
-}
-```
-
-这个 `do {} while(1)` 循环意味着：**GIC 可以在一次异常入口中处理完所有待处理的中断**，避免多次异常进出。当所有中断处理完毕后，`GICC_IAR` 返回 1023（spurious ID），循环退出。
-
-### 6.7 ARM64 中断入口的完整路径
-
-总结从硬件触发到驱动 handler 的完整路径：
-
-```
-GPIO 引脚电平变化
-  → EXTI 检测边沿，向 GIC 发送 SPI 信号
-  → GIC Distributor 路由到 CPU Interface
-  → CPU Interface 向核断言 nIRQ 信号
-  → CPU 查 VBAR_EL1 → vectors 表
-  → kernel_ventry 1, h, 64, irq            ← entry.S 汇编入口
-  → kernel_entry: 保存 pt_regs 到栈上
-  → el1h_64_irq_handler(regs)              ← entry-common.c C 入口
-  → el1_interrupt(regs, handle_arch_irq)    ← 关闭本地 IRQ
-  → __el1_irq(regs, handler)
-  → irq_enter_rcu()                         ← 记录中断上下文
-  → do_interrupt_handler(regs, gic_handle_irq) ← 调用 GIC 主循环
-  → gic_handle_irq:
-      do {
-          readl(GICC_IAR) → hwirq
-          generic_handle_domain_irq(gic->domain, hwirq)
-              → irq_find_mapping → virq
-              → generic_handle_irq_desc(virq)
-                  → desc->handle_irq()  /* handle_fasteoi_irq */
-      } while(1)
-  → irq_exit_rcu()                          ← 中断退出，触发软中断
-  → do_softirq() / wakeup_ksoftirqd()       ← 下半部执行
-  → exit_to_kernel_mode(regs)               ← 恢复寄存器，返回
-```
-
-**这就是 ARM64 上从硬件中断到驱动 handler 的完整路径**。STM32MP257（Cortex-A35）正是采用这条路径处理所有的 GPIO 按键中断。
-
----
-
-## 7. 总结
-
-30 年来，Linux 中断子系统经历了 4 次关键重构：
-
-| 时间 | 版本 | 变革 | 核心人物 | 解决什么问题 |
-|------|------|------|---------|------------|
-| 2003~2006 | v2.6.8~v2.6.24 | Generic IRQ Layer：流控与芯片操作分离 | Thomas Gleixner, Ingo Molnar, Russell King | `__do_IRQ()` 混合流控和硬件操作，无法扩展 |
-| 1999~2012 | v2.3~v3.2 | 下半部：BH→Softirq→Tasklet→Workqueue→Threaded IRQ | Alexey Kuznetsov, Tejun Heo, Thomas Gleixner | BH 全局锁瓶颈、SMP 扩展性差 |
-| 2011 | v2.6.38 | irq_domain：hwirq→virq 映射 | Grant Likely | 设备树多重中断控制器的编号冲突 |
-| 2013+ | v3.7+ | 层级 irq_domain + ARM64 支持 | ARM 社区, Thomas Gleixner | 链式分发延迟、ARM64 新架构 |
-
-每个数据结构和 API 都是**对特定历史问题的回应**，不是凭空设计出来的。
-
-对于 STM32MP257 开发来说，理解这些历史能帮你快速定位：
-- 为什么需要理解和区分链式 vs 层级？→ EXTI 是层级域，pinctrl 也是层级域
-- 为什么需要 irq_domain？→ 否则 `/proc/interrupts` 中的中断号没有任何结构
-- 为什么需要 `irq_chip_*_parent()` 系列函数？→ 层级域下 irq_chip 操作需要递归到父级
-- 为什么下半部有 4 种选择？→ 不同的性能/延迟/睡眠需求
-
-回到你实测的按键中断数据：
-
-```
-/sys/kernel/debug/irq/irqs/70:
-  handler:  handle_fasteoi_irq         ← Generic IRQ Layer 的流控函数
-  chip:     stm32gpio → stm32mp-exti → GICv2   ← 层级 irq_chip 递归
-  domain:   pinctrl → exti → gic                 ← 层级 irq_domain 三级
-```
-
-这三行数据浓缩了中断子系统 30 年的演进结果。
