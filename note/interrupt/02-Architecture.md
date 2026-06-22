@@ -8,9 +8,49 @@
 
 ## 1. 设计思想：四个核心问题与四层架构
 
-### 1.1 中断子系统的四个核心问题
+### 1.1 先看中断信号的完整路径
 
-从 CPU 收到一个中断信号到驱动开发者注册的 `handler()` 被执行，内核必须回答四个问题：
+把"中断"想象成一个物理信号——它从外设出发，经过中断控制器，最终到达 CPU，触发一段软件代码执行。我们可以沿着这条路径走一遍，看内核每一步需要解决什么问题。
+
+以 STM32MP257 开发板上的按键 PH5 按下为例：
+
+```
+PH5 按键按下（GPIO 电平变化）
+    │
+    │  步骤 1：中断信号从哪条路进来？
+    │  GPIO bank 检测到电平变化，输出信号给 EXTI
+    │
+    ▼
+EXTI 边沿检测 → 设置 pending 位（RPR/FPR）
+    │
+    │  步骤 2：这个信号对应 GIC 的哪个中断号？
+    │  EXTI 通过硬件连线把事件送给 GIC 的某个 SPI
+    │
+    ▼
+GIC Distributor 接收中断信号
+    │  步骤 3：GIC 知道这个中断该发给哪个 CPU 吗？
+    │  查配置的 affinity——发给 CPU0
+    │
+    ▼
+CPU0 的 GIC CPU Interface 收到中断
+    │  步骤 4：CPU 怎么知道自己该处理什么？
+    │  读 GICC_IAR 拿到中断号，查 irq_domain 转成 virq
+    │
+    ▼
+irq_desc[virq].handle_irq 被调用
+    │  步骤 5：怎么开关这个中断、怎么确认它？
+    │  调 irq_chip 的回调——mask/ack/eoi
+    │
+    ▼
+irqaction->handler() 被执行
+    │  步骤 6：最终谁处理这个中断？
+    │  设备驱动注册的 handler——是按键消抖还是马里奥跳跃
+    │
+    ▼
+真正的"处理"完成
+```
+
+沿着这条路径，中断子系统要解决的问题可以归纳为四个层次：
 
 | # | 问题 | 管什么 | 对应层次 |
 |---|------|--------|---------|
@@ -19,7 +59,7 @@
 | 3 | **路由** | 这个中断发给哪个 CPU？ | irq_chip + GIC 分发逻辑 |
 | 4 | **分发** | 哪个驱动的 handler 来处理？ | irq_desc + irqaction 链表 |
 
-这四个问题不是并列关系，而是 **从硬件向软件逐层映射** 的层级关系：
+下面用 ASCII 图展示这四个问题的层级关系——**从硬件向软件逐层映射**：
 
 ```
 硬件中断信号
@@ -319,6 +359,53 @@ static void gic_eoimode1_eoi_irq(struct irq_data *d)
 ```
 
 STM32MP2 把 GICC 的地址偏移 `0x10000` 当成 Deactivate 寄存器使用。这是 ST 对 GICv2 IP 的客制化——让 Priority Drop 和 Deactivate 可以分开控制。
+
+#### Split EOI and Deactivate：为什么需要两步走
+
+GICv2 允许编程模式将 EOI 和 Deactivate 拆成两步（Split mode）。传统模式下写 `GICC_EOIR` 同时完成两件事：
+1. **优先级降级（Priority Drop）**——告诉 GIC 当前中断处理完了，CPU 可以接收更低优先级的中断
+2. **停用中断（Deactivate）**——将中断状态从 Active 变回 Inactive，允许该中断再次触发
+
+分开的意义在于**虚拟化场景**：
+
+```
+时间轴 →
+                    Host 收到中断          Guest 处理完中断
+                         │                      │
+                         ▼                      ▼
+   ┌───────────────────────────────────────────────────────┐
+   │ 中断状态: Pending → Active           Active → Inactive   │
+   │                  ▲                      ▲              │
+   │                  │                      │              │
+   │             读 GICC_IAR             写 GICC_DIR        │
+   │             （隐式 ack + 置 Active）   （Deactivate）      │
+   │                                                       │
+   │                  ───── EOI 写 GICC_EOIR ─────          │
+   │                （只做 Priority Drop，不做 Deactivate）    │
+   └───────────────────────────────────────────────────────┘
+```
+
+关键场景：
+1. 物理设备产生中断，GIC 将中断标记为 Pending，发给 CPU
+2. Host（Hypervisor）读 `GICC_IAR`，状态变为 Active，开始处理
+3. Host 写 `GICC_EOIR`（**只 Priority Drop，不 Deactivate**），允许 CPU 继续接收其他中断
+4. Host 切回 VM，VM 中的 Guest OS 处理这个虚拟中断
+5. Guest 处理完后，Host 写 `GICC_DIR`（**真正的 Deactivate**），中断状态回到 Inactive
+
+如果 EOI 和 Deactivate 不分开，第 3 步写 EOI 时就把中断 deactivate 了——物理中断消失，VM 里看不到中断。
+
+STM32MP2 的客制化 GIC IP 中，GICC 的 `0x10000` 偏移被映射为 Deactivate 寄存器（`GIC_STM32_CPU_DEACTIVATE`）。ST 在驱动中通过 `gic_stm32_gicc_dir_access` 静态分支判断是否使用这个客制化路径（`irq-gic.c`，第 247 行）：
+
+```c
+if (static_branch_unlikely(&gic_stm32_gicc_dir_access))
+    writel_relaxed(hwirq, gic_cpu_base(d) + GIC_STM32_CPU_DEACTIVATE);
+else
+    writel_relaxed(hwirq, gic_cpu_base(d) + GIC_CPU_DEACTIVATE);
+```
+
+静态分支 `gic_stm32_gicc_dir_access` 在 `gic_of_setup()` 中根据 DTS 信息初始化。支持分段模式的 GIC，`GICC_DIR` 寄存器（偏移 `0x1000`）可用；否则只能写标准 `GICC_EOIR` 同时完成 Priority Drop + Deactivate。
+
+这个功能在 Notion 笔记中被称为"中断处理的分段式管理"——将"可以接收新中断"（Priority Drop）和"关闭本次中断"（Deactivate）在时间上解耦。
 
 **EXTI 的 EOI**（`irq-stm32mp-exti.c`，第 359 行）：
 
@@ -764,6 +851,76 @@ EXTI 的 stm32mp_exti_domain_alloc()
 5. 调 `irq_domain_alloc_irqs_parent()` → GIC 的 `translate` → 得到 GIC 的 hwirq
 6. GIC 分配 virq，设置 `gic_chip` + `handle_fasteoi_irq`
 7. 返回最终的 virq——下层是 EXTI 的 chip，上层（parent_data）是 GIC 的 chip
+
+#### 链式（Chained）vs 层级（Hierarchy）：两种中断控制器架构对比
+
+链式和层级是 Linux 中断子系统中"下级中断控制器"的两种实现架构。它们在教材中有详细图解，核心区别是**多个下级中断信号如何映射到 GIC 的中断线**：
+
+| 特性 | 链式（Chained） | 层级（Hierarchy） |
+|------|----------------|-----------------|
+| **拓扑** | 多个下级中断 → 共用 1 条 GIC SPI | 每个下级中断 → 各占 1 条 GIC SPI |
+| **映射方式** | 多对一 | 一对一 |
+| **irq_desc 数量** | 多个（每层独立） | 一个（层级共用） |
+| **入口函数** | 两级 flow handler：GIC handler → 下级 handler → action | 一级 flow handler（GIC 的），下级 chip 回调嵌入 parent_data 链 |
+| **中断源细分** | 下级驱动读寄存器细分（需要软件分辨） | GIC 硬件直接分辨（不需要软件参与） |
+| **数据结构** | 两个 irq_desc 各自独立，无 parent_data 链 | 一个 irq_desc，irq_data 通过 parent_data 形成链表 |
+| **适用场景** | 传统 GPIO 控制器（如 i.MX6ULL 的 GPIO） | 现代 SoC 的中断控制器（如 EXTI、MSI 控制器） |
+
+**链式架构**的处理流程（以 GPIO 作为下级控制器为例）：
+
+```
+外设触发中断
+    │
+    ▼
+GIC 检测到 SPI 33 → hwirq=33 → virq=17（GIC domain 映射）
+    │
+    ▼
+irq_desc[17].handle_irq（handleB——由 GPIO 驱动设置）
+    │
+    ├─ mask/ack: 调 irq_dataA->irq_chip（GIC 的回调）
+    ├─ 读取 GPIO 寄存器，确定是 GPIO 2 号引脚
+    ├─ GPIO domain 翻译：hwirq=2 → virq=102
+    ├─ 调 irq_desc[102].handle_irq（handleC——另一个 handler）
+    │     ├─ mask/ack: 调 irq_dataB->irq_chip（GPIO 的回调）
+    │     ├─ 调 action->handler()（用户注册的 handler）
+    │     └─ unmask: 调 irq_dataB->irq_chip
+    └─ unmask: 调 irq_dataA->irq_chip
+```
+
+**层级架构**的处理流程（以 STM32MP2 EXTI 为例）：
+
+```
+外设触发中断
+    │
+    ▼
+GIC 检测到 SPI 153 → hwirq=153 → virq=N（GIC domain 映射）
+    │
+    ▼
+irq_desc[N].handle_irq（handle_fasteoi_irq——由 GIC 设置）
+    │
+    ├─ mask/ack:
+    │    ├─ 调 irq_data->chip->irq_mask = stm32mp_exti_mask
+    │    │    └─ 写 EXTI_IMR + irq_chip_mask_parent()
+    │    │         └─ 调 parent_data->chip->irq_mask = gic_mask_irq
+    │    └─（ack 通过 parent 链转发）
+    ├─ 调 action->handler()（用户注册的 handler）
+    └─ unmask/eoi:
+         ├─ 调 irq_data->chip->irq_eoi = stm32mp_exti_eoi
+         │    ├─ 清 RPR/FPR + 恢复 IMR
+         │    └─ irq_chip_eoi_parent() → gic_eoi_irq
+```
+
+**两种架构的历史定位**（与 00-History §5 呼应）：
+
+| | 链式 | 层级 |
+|--|------|------|
+| **引入时间** | v2.6.x，GPIO 控制器时代 | v3.14+，MSI/VFIO 时代 |
+| **典型代表** | i.MX6ULL GPIO → `gpio-mxc.c` | STM32MP EXTI → `irq-stm32mp-exti.c` |
+| **设计思想** | "软件分辨"——下级驱动读寄存器判断哪个子中断触发 | "硬件分辨"——每个子中断独占一条中断线 |
+| **扩展性** | 子中断数量受限于下级驱动 | 支持随意扩展，parent_data 链无长度限制 |
+| **Debug 难度** | 两级 irq_desc，`/proc/interrupts` 看到两个中断号 | 单级 irq_desc，`/proc/interrupts` 只看到一个 |
+
+STM32MP2 的 EXTI 采用层级架构（通过 `irq_domain_add_hierarchy()` 注册）。各 GPIO bank 的中断分别对应不同的 EXTI event 和 GIC SPI，硬件上已经分辨好了，不需要在软件中遍历 GPIO 寄存器来细分中断源。
 
 ---
 
@@ -1416,6 +1573,66 @@ if (gic_irqs > 1020)
 ```
 
 对于 STM32MP257，`GICD_CTR.IT_LINES_NUMBER` 字段指示的中断线数量决定了 GIC domain 的 `revmap` 大小。
+#### GIC 中断的四种状态
+
+GICv2 规范定义了中断的四种硬件状态，它们在 Distributor 的寄存器中通过 Active 和 Pending 位组合表示：
+
+| 状态 | Pending 位 | Active 位 | 含义 |
+|------|-----------|----------|------|
+| **Inactive（非活动）** | 0 | 0 | 未触发，中断线空闲 |
+| **Pending（挂起）** | 1 | 0 | 中断已触发，等待 CPU 处理 |
+| **Active（活动）** | 0 | 1 | CPU 正在处理该中断 |
+| **Active and Pending（活动且挂起）** | 1 | 1 | CPU 正在处理，同一中断源再次触发 |
+
+四种状态的转换路径如下：
+
+```
+                   外设触发中断
+                         │
+                         ▼
+     ┌──────────┐    读 GICC_IAR    ┌──────────┐
+     │ Pending  │ ─────────────►   │  Active  │
+     │          │                  │          │
+     └────┬─────┘                  └────┬─────┘
+          │                             │
+          │ 外设在处理期间            │ 写 GICC_EOIR
+          │ 再次触发                  │ （或 GICC_DIR）
+          ▼                             ▼
+     ┌──────────┐                  ┌──────────┐
+     │ Active & │                  │ Inactive │
+     │ Pending  │                  │          │
+     └──────────┘                  └──────────┘
+```
+
+四种状态的核心价值在于 **Active and Pending** 状态。它解决了电平/边沿中断的一个本质问题：**CPU 正在处理一个中断时，同一中断源再次触发怎么办？**
+
+- 对电平中断，外设保持电平为高，GIC 看到 pending 位本来就是 1。但 Active 位也是 1（因为 CPU 正在处理），所以状态是 Active and Pending。等 CPU 完成 EOI/Deactivate 后，状态回到 Pending，中断立即再次触发——这就是 `handle_level_irq` 必须在入口 mask 的原因，否则死循环
+
+- 对边沿中断，第二个边沿使 pending 位再次置 1（Active 位仍为 1），状态进入 Active and Pending。`handle_edge_irq` 在处理完一轮后检查 pending 位，有 pending 就再跑一轮 handler——不会丢边沿
+
+用户可以通 `irq_chip` 的 `irq_get_irqchip_state` 回调读取任一种状态：
+
+```c
+/* irq-gic.c，第 279 行 */
+static int gic_irq_get_irqchip_state(struct irq_data *d,
+                                      enum irqchip_irq_state which, bool *val)
+{
+    switch (which) {
+    case IRQCHIP_STATE_PENDING:
+        *val = gic_peek_irq(d, GIC_DIST_PENDING_SET);
+        break;
+    case IRQCHIP_STATE_ACTIVE:
+        *val = gic_peek_irq(d, GIC_DIST_ACTIVE_SET);
+        break;
+    case IRQCHIP_STATE_MASKED:
+        *val = !gic_peek_irq(d, GIC_DIST_ENABLE_SET);
+        break;
+    ...
+    }
+}
+```
+
+`GIC_DIST_PENDING_SET`（GICD_ISPENDR）和 `GIC_DIST_ACTIVE_SET`（GICD_ISACTIVER）分别对应 Pending 和 Active 位的读取。
 
 ### 6.2 EXTI 控制器内部结构
 
@@ -1455,6 +1672,35 @@ exti1: interrupt-controller@44220000 {
 | TRG | 0x3EC | 触发类型寄存器（configurable event vs direct） |
 
 > 这个 TRG 寄存器很关键——它决定了这个 event 是走**可配置通道**（`stm32mp_exti_chip`，含 EOI/mask/unmask/set_type）还是**直通通道**（`stm32mp_exti_chip_direct`，委托 parent）。驱动在 `stm32mp_exti_domain_alloc()` 中根据 TRG 位选择 chip 实例。
+> **GPIO mux 的硬件选路约束**：STM32MP2 的 EXTI 控制器有 16 个外部中断线（EXTI0~EXTI15），每个 EXTIx **只能从 PAx、PBx、……、PKx 中选择一个 GPIO 引脚作为中断源**。也就是说，PA0 使用了 EXTI0，PB0 就不能再使用 EXTI0。这与很多 SoC 的"任一 GPIO 引脚都可以独立产生中断"不同——STM32MP2 的 GPIO 中断是**通过 EXTI mux 共享 16 条中断线的**。
+>
+> 驱动中 `stm32mp_exti_test_gpio_mux_available()`（第 548 行）实现这一选路约束检查：
+>
+> ```c
+> static bool stm32mp_exti_test_gpio_mux_available(
+>     struct stm32mp_exti_host_data *host_data,
+>     unsigned int bank_nr, unsigned int gpio_nr)
+> {
+>     if (gpio_nr >= STM32MP_GPIO_IRQ_LINES)  /* 只支持 EXTI0~EXTI15 */
+>         return false;
+>     if (!test_bit(gpio_nr, host_data->gpio_mux_used) ||
+>         bank_nr == host_data->gpio_mux_pos[gpio_nr])  /* 同 bank 可以复用 */
+>         return true;
+>     return false;  /* 冲突！不同 bank 的相同 GPIO 号 */
+> }
+> ```
+>
+> 逻辑：每个 `gpio_nr`（即 EXTI 线号）第一次被使用时记录 `gpio_mux_pos[gpio_nr] = bank_nr`，后续再分配时只允许同一个 bank 使用这条线。例如 PH5（bank=7, pin=5）用了 EXTI5，同一 bank 的另一个 PH 引脚还可以用 EXTI5（通过 `EXTI_CR` 的 mux 重新选路），但 PA5 就不能再用 EXTI5。
+>
+> 硬件上这个选路是通过 `EXTI_CR(n)` 寄存器配置的（`irq-stm32mp-exti.c`，第 35 行）：
+>
+> ```c
+> #define EXTI_CR(n)         (0x060 + ((n) / 4) * 4)
+> #define EXTI_CR_SHIFT(n)   (((n) % 4) * 8)
+> #define EXTI_CR_MASK(n)    (GENMASK(7, 0) << EXTI_CR_SHIFT(n))
+> ```
+>
+> 每个 EXTI_CR 寄存器管理 4 个 EXTI 线的 GPIO bank 选路，每个线占 8 bit。值 `0x07` 表示 PH bank（bank 7）。
 
 每个 event 的硬件中断号映射关系（`stm32mp_exti_domain_alloc` 中 `interrupts-extended` 路径）：
 
