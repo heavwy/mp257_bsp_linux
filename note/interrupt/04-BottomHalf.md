@@ -178,22 +178,50 @@ void open_softirq(int nr, void (*action)(struct softirq_action *))
 }
 ```
 
-简单到极致。`NR_SOFTIRQS` 个槽位的全局数组，注册就是填函数指针。**但只有 `softirq_init` 注册的两个（TASKLET/HI）是在内核初始化早期注册的**，其余由各子系统在 initcall 阶段自行注册。
+简单到极致。`NR_SOFTIRQS` 个槽位的全局数组，注册就是填函数指针。
 
-**STM32MP257 系统中各 softirq 的注册时机：**
+**但 `softirq_init` 只注册了 TASKLET 和 HI 两个**（§2.7），其余 8 个由各子系统自行注册：
 
-| 向量 | 注册函数 | 调用位置 |
-|------|---------|---------|
-| TASKLET_SOFTIRQ | softirq_init | start_kernel 中 |
-| HI_SOFTIRQ | softirq_init | 同上 |
-| TIMER_SOFTIRQ | timer_init | start_kernel 中 |
-| HRTIMER_SOFTIRQ | hrtimer_init | start_kernel 中 |
-| SCHED_SOFTIRQ | sched_init | start_kernel 中 |
-| RCU_SOFTIRQ | rcu_init | start_kernel 中 |
-| NET_TX/RX_SOFTIRQ | 网络子系统 initcall | do_initcalls 时 |
-| BLOCK_SOFTIRQ | 块子系统 initcall | do_initcalls 时 |
+```c
+// kernel/softirq.c:915 — softirq_init
+open_softirq(TASKLET_SOFTIRQ, tasklet_action);
+open_softirq(HI_SOFTIRQ, tasklet_hi_action);
 
-从 `smp_softirq_threads` 创建 `ksoftirqd/N` 线程（`kernel/softirq.c:970`），每个 CPU 一个。
+// kernel/time/timer.c:2310 — 时钟子系统 init
+open_softirq(TIMER_SOFTIRQ, run_timer_softirq);
+
+// kernel/time/hrtimer.c:2278 — 高精度定时器 init
+open_softirq(HRTIMER_SOFTIRQ, hrtimer_run_softirq);
+
+// kernel/sched/fair.c:13236 — 调度器 init
+open_softirq(SCHED_SOFTIRQ, run_rebalance_domains);
+
+// kernel/rcu/tree.c:5078 — RCU 子系统 init
+open_softirq(RCU_SOFTIRQ, rcu_core_si);
+
+// net/core/dev.c:11661 — 网络子系统 initcall
+open_softirq(NET_TX_SOFTIRQ, net_tx_action);
+open_softirq(NET_RX_SOFTIRQ, net_rx_action);
+
+// block/blk-mq.c:5020 — 块子系统 initcall
+open_softirq(BLOCK_SOFTIRQ, blk_done_softirq);
+```
+
+| 向量 | 注册代码位置 | 初始化阶段 |
+|------|------------|-----------|
+| TASKLET_SOFTIRQ | `kernel/softirq.c:915`（softirq_init） | start_kernel |
+| HI_SOFTIRQ | `kernel/softirq.c:916`（softirq_init） | start_kernel |
+| TIMER_SOFTIRQ | `kernel/time/timer.c:2310`（timer_init） | start_kernel |
+| HRTIMER_SOFTIRQ | `kernel/time/hrtimer.c:2278`（hrtimer_init） | start_kernel |
+| SCHED_SOFTIRQ | `kernel/sched/fair.c:13236`（sched_init） | start_kernel |
+| RCU_SOFTIRQ | `kernel/rcu/tree.c:5078`（rcu_init） | start_kernel |
+| NET_TX_SOFTIRQ | `net/core/dev.c:11661`（net_dev_init） | do_initcalls → subsys_initcall |
+| NET_RX_SOFTIRQ | `net/core/dev.c:11662`（net_dev_init） | do_initcalls → subsys_initcall |
+| BLOCK_SOFTIRQ | `block/blk-mq.c:5020`（blk_mq_init） | do_initcalls → subsys_initcall |
+
+前 6 个在 `start_kernel` 中注册，此时内存管理、调度器、中断系统正在逐步就绪。后 3 个在 `do_initcalls` 阶段注册——此时所有核心子系统已完全就绪，网络和块设备驱动可以正常加载。
+
+ksoftirqd 线程也不是 `softirq_init` 创建的，而是通过 `smpboot_register_percpu_thread` 在 `early_initcall(spawn_ksoftirqd)` 中创建（`kernel/softirq.c:970`），每个 CPU 一个。这意味着在 `early_initcall` 之前，系统中不存在 ksoftirqd 线程——此时 softirq 只能在 `irq_exit_rcu` 路径中直接执行。
 
 ### 2.4 触发：raise_softirq
 
@@ -239,74 +267,206 @@ void __raise_softirq_irqoff(unsigned int nr)
 
 ### 2.5 调度循环：handle_softirqs
 
-`__do_softirq()` 是软中断的入口（`kernel/softirq.c:592`），它直接调用 `handle_softirqs(false)`。ksoftirqd 线程则调用 `handle_softirqs(true)`：
+`__do_softirq()` 是软中断的入口（`kernel/softirq.c:592`），它直接调用 `handle_softirqs(false)`。ksoftirqd 线程则调用 `handle_softirqs(true)`。两者调用的是同一个函数，参数 `ksirqd` 只在 CONFIG_PREEMPT_RT 下有区别，非 RT 内核中未使用：
 
 ```c
 // kernel/softirq.c:517
 static void handle_softirqs(bool ksirqd)
 {
-    unsigned long end = jiffies + MAX_SOFTIRQ_TIME;   // 2ms 硬限
-    int max_restart = MAX_SOFTIRQ_RESTART;             // 10 次重入
+    unsigned long end = jiffies + MAX_SOFTIRQ_TIME;   // 软中断最长允许执行 2ms
+    int max_restart = MAX_SOFTIRQ_RESTART;             // 最多重入 10 次
     __u32 pending;
     int softirq_bit;
 
-    pending = local_softirq_pending();                 // ① 取 pending
+    /* ── ① 取当前 CPU 的 pending 位图 ── */
+    pending = local_softirq_pending();
+    // pending 是一个 32bit 整数，bit N = 1 表示 softirq 向量 N 待处理
+    // 例如 pending=0b1000001 → bit 0 (HI) 和 bit 6 (TASKLET) 有请求
 
-    softirq_handle_begin();
+    softirq_handle_begin();   // softirq context 进入计数 +1
 
+    /* ── ② 重置 pending，然后开中断执行 ── */
 restart:
-    set_softirq_pending(0);                            // ② 清 pending
+    set_softirq_pending(0);   // 清空 pending 位图
+    // ★ 为什么必须先清空？
+    //    pending 局部变量保存了"本次要处理的位图快照"。
+    //    清掉实际寄存器后，action 执行期间新 raise 的 softirq
+    //    （通过 or_softirq_pending）会从一个干净的 0 开始置位。
+    //
+    //    如果不清，第 ⑥ 步读到的 pending 会是：
+    //      旧 bit（处理前就有的） + 新 bit（处理期间新来的）
+    //    → 无法区分"这个 bit 是已经处理过的旧事件还是新事件"
+    //    → goto restart 后会重复处理已经处理过的 softirq 向量
+    //
+    //    清了之后，第 ⑥ 步读到的 pending 全部是处理期间新来的，
+    //    不存在"旧 bit 残留"的问题，每次 restart 都是针对新事件。
 
-    local_irq_enable();                                // ③ 开中断！
+    local_irq_enable();       // ★ 开中断！softirq 执行时允许硬件中断嵌套
+    //    这是 softirq context 与 hardirq context 的关键区别：
+    //    hardirq 中 IRQ 是关闭的，softirq 中 IRQ 是打开的。
+    //    高优先级硬件中断可以抢占正在执行的 softirq。
 
-    h = softirq_vec;
+    h = softirq_vec;          // 指向 softirq_vec[0] = HI_SOFTIRQ
 
-    while ((softirq_bit = ffs(pending))) {             // ④ 遍历位图
+    /* ── ③ 遍历 pending 位图 ── */
+    while ((softirq_bit = ffs(pending))) {
+    // ffs = find first set，从最低位(bit 0)开始找第一个 1
+    // ffs(0b100100000) = 6 → TASKLET_SOFTIRQ
+    // ffs(0b000000001) = 1 → HI_SOFTIRQ
+    // ★ bit 0 (HI_SOFTIRQ) 总是最先执行——这是高优先级的实现机制
         unsigned int vec_nr;
-        h += softirq_bit - 1;
-        vec_nr = h - softirq_vec;
+        h += softirq_bit - 1;  // 定位到对应的 softirq_vec 条目
+        vec_nr = h - softirq_vec;  // 计算向量编号（用于 trace）
 
         trace_softirq_entry(vec_nr);
-        h->action(h);                                  // ⑤ 调 action
+        h->action(h);          // ← 执行 softirq 回调函数！
+        // 例：如果 vec_nr=6 (TASKLET_SOFTIRQ)，这里调 tasklet_action()
+        // tasklet_action 会摘下当前 CPU 的 tasklet_vec 链表并遍历执行
         trace_softirq_exit(vec_nr);
 
-        h++;
-        pending >>= softirq_bit;
+        h++;                   // 指向下一个 softirq_vec 条目
+        pending >>= softirq_bit;  // 移除已处理的 bit，准备检查下一个
+        // 例：pending=0b100100000, softirq_bit=6
+        //     pending >>= 6 → 0b100 (只剩下 bit 2 = NET_TX)
     }
 
+    /* ── ④ 关中断，检查执行期间新产生的 pending ── */
     local_irq_disable();
 
-    pending = local_softirq_pending();                 // ⑥ 检查新 pending
+    pending = local_softirq_pending();  // 读新 pending（第 ② 步之后新置位的）
     if (pending) {
-        if (time_before(jiffies, end) && !need_resched() &&
-            --max_restart)
-            goto restart;                              // 2ms 内 + <10 次 → 继续
-        wakeup_softirqd();                             // 超限 → 交给 ksoftirqd
+    // 有新的 softirq 在刚才的执行过程中被 raise 了
+    // 例如：tasklet_action 中执行了 t->callback(t)，callback 又调了
+    //       tasklet_schedule 再次触发同一个 softirq
+        if (time_before(jiffies, end)      // 还在 2ms 时限内
+            && !need_resched()              // 没有更高优先级的任务要运行
+            && --max_restart)               // 还没超过 10 次重入限制
+            goto restart;                   // 继续执行（在中断返回路径上）
+        // 三个条件任一不满足：
+        wakeup_softirqd();                  // 交给 ksoftirqd 慢慢处理
+        // ksoftirqd 是一个可被抢占的内核线程，不会饿死用户态进程
     }
-    ...
+
+    account_softirq_exit(current);
+    lockdep_softirq_end(in_hardirq);
+    softirq_handle_end();     // softirq context 退出计数 -1
+    current_restore_flags(old_flags, PF_MEMALLOC);
 }
 ```
 
-**逐段分析：**
+**为什么需要 MAX_SOFTIRQ_TIME 和 MAX_SOFTIRQ_RESTART 两个限制？**
 
-**① 取 pending：** 读出当前 CPU 的 pending 掩码。这是后续遍历的唯一依据。
+如果 softirq 处理中不断有新的 pending 被触发（例如网络高负载下 `NET_RX_SOFTIRQ` 执行中又有新包到达，handler 再次 raise 自己），`goto restart` 会一直执行，用户态进程得不到 CPU。
 
-**② 清 pending：** 清空 `__softirq_pending`。注意：执行过程中其他 CPU 或硬件可以继续置位——这些新 pending 不会被本次循环消费，留到第 ⑥ 步检查。
+- `MAX_SOFTIRQ_TIME = 2ms`（`kernel/softirq.c:481`）：软中断总执行时间不超过 2ms
+- `MAX_SOFTIRQ_RESTART = 10`（`kernel/softirq.c:482`）：最多重入 10 次
 
-**③ 开中断：** 允许硬件中断嵌套。这是 softirq context 与 hardirq context 的关键区别——softirq 执行时中断是打开的，允许高优先级中断抢占。
+任一超限就不再继续，唤醒 ksoftirqd 在进程上下文中慢慢处理。ksoftirqd 可以被抢占，所以用户态进程仍然能得到 CPU 时间。
 
-**④ ffs 遍历：** 从最低 bit 开始，找到第一个置位位。这就是 HI_SOFTIRQ (bit 0) 永远最先执行的原因。ffs（find first set）从 bit 0 开始扫描。
+**`ffs` 从 bit 0 开始遍历的优先级效果：**
 
-**⑤ 执行 action：** `h->action(h)`。softirq_vec 中每个向量的 action 函数执行时，interrupts 是 enabled 的。
+| softirq 向量 | bit 位置 | ffs 顺序 |
+|-------------|---------|---------|
+| HI_SOFTIRQ | 0 | 最先执行 |
+| TIMER_SOFTIRQ | 1 | 第 2 |
+| NET_TX_SOFTIRQ | 2 | 第 3 |
+| NET_RX_SOFTIRQ | 3 | 第 4 |
+| BLOCK_SOFTIRQ | 4 | 第 5 |
+| IRQ_POLL_SOFTIRQ | 5 | 第 6 |
+| TASKLET_SOFTIRQ | 6 | 第 7 |
+| SCHED_SOFTIRQ | 7 | 第 8 |
+| HRTIMER_SOFTIRQ | 8 | 第 9 |
+| RCU_SOFTIRQ | 9 | 最后执行 |
 
-**⑥ 重入检测：**
-- `time_before(jiffies, end)`：`MAX_SOFTIRQ_TIME = 2ms`（`kernel/softirq.c:481`）
-- `max_restart`：`MAX_SOFTIRQ_RESTART = 10`（`kernel/softirq.c:482`）
-- 两者任一超限 → 不继续执行，唤醒 ksoftirqd 在进程上下文中慢慢处理
-
-为什么需要这两个限制？**防止 softirq 无限循环饿死用户态进程。** 如果 softirq 处理中不断有新的 pending 被触发（例如网络高负载下），`goto restart` 会一直执行，用户态进程得不到 CPU。2ms + 10 次重入后，剩下的交给 ksoftirqd（它是一个可调度的内核线程，可以被抢占）。
+bit 位置越小的向量越先执行。这就是 HI_SOFTIRQ（高优先级 tasklet）先于 TASKLET_SOFTIRQ（普通 tasklet）执行的原因。
 
 ### 2.6 ksoftirqd：per-CPU 守护线程
+
+§2.5 分析了 `handle_softirqs` 的循环逻辑。它有**两个调用者**（§2.1 已介绍）：
+
+| 调用者 | 调用方式 | 执行上下文 |
+|--------|---------|-----------|
+| `__do_softirq()` | `handle_softirqs(false)` | 中断返回路径（§2.5 分析的就是这个）|
+| `run_ksoftirqd()` | `handle_softirqs(true)` | ksoftirqd 内核线程 |
+
+`run_ksoftirqd` 的代码很简单：
+
+两条路径的触发和执行不是孤立的，而是通过三个环节串联：
+
+```
+                    ┌──────────────────┐
+                    │  raise_softirq()  │ ← 输入端：谁都可以调，置 pending
+                    └────────┬─────────┘
+                             │
+              ┌──────────────┴──────────────┐
+              │ in_interrupt() 的值         │
+              │（调 raise_softirq 时的上下文）│
+              ├──────────────┬──────────────┤
+              │ true         │ false        │
+              │（中断上下文中）│（进程上下文中）│
+              └──────┬───────┴──────┬───────┘
+                     │              │
+             只置 pending    置 pending +
+             不唤醒 ksoftirqd  唤醒 ksoftirqd
+                     │              │
+                     ▼              ▼
+          ┌─────────────────┐   ┌──────────────────┐
+          │ __irq_exit_rcu │   │ ksoftirqd 被调度  │
+          │ → invoke_softirq│   │ → run_ksoftirqd  │
+          └───────┬─────────┘   └────────┬─────────┘
+                  │                      │
+          ┌───────┴───────────┐     ┌────┴────┐
+          │ force_irqthreads? │     │路径 B   │
+          │ (invoke_softirq内)│     │handle_  │
+          ├────────┬──────────┤     │softirqs │
+          │ no     │ yes      │     │(true)   │
+          │(默认)  │          │     └─────────┘
+          ├────────┴──────────┤
+          │ 路径 A            │
+          │ __do_softirq      │
+          │ → handle_softirqs │
+          │   (false)         │
+          └────────┬──────────┘
+                   │
+          ┌────────┴──────────────┐
+          │ 处理完，检查新 pending │
+          ├───────┬───────────────┤
+          │ 有    │ 没有          │
+          │ 且    │ → 返回        │
+          │未超限 │               │
+          │→继续  │               │
+          │ 超限  │               │
+          │→唤醒  │               │
+          │ ksoft │               │
+          │ irqd  │               │
+          └───────┴───────────────┘
+                   │ 超限时
+                   ▼
+          ┌──────────────────┐
+          │ wakeup_softirqd()│ ← 路径 A 超限后也切到路径 B
+          │ → ksoftirqd      │
+          └──────────────────┘
+```
+
+**三个场景走哪个路径：**
+
+```
+场景一：顶半部中调 tasklet_schedule → raise_softirq(TASKLET_SOFTIRQ)
+  → in_interrupt()=true → 只置 pending
+  → 中断返回 → __irq_exit_rcu → invoke_softirq → __do_softirq（路径 A）
+  → 紧贴顶半部执行 tasklet_action
+
+场景二：进程上下文中调 raise_softirq
+  → in_interrupt()=false → 置 pending + wakeup_softirqd
+  → ksoftirqd 被调度时执行（路径 B）
+
+场景三：路径 A 执行中不断有新 pending，2ms/10 次超限
+  → wakeup_softirqd（切到路径 B）
+  → handle_softirqs 返回 → eret 恢复被中断的进程
+  → ksoftirqd 稍后被调度时继续处理
+```
+
+ksoftirqd 本身就是一个简单循环：
 
 ```c
 // kernel/softirq.c:924
@@ -314,46 +474,49 @@ static void run_ksoftirqd(unsigned int cpu)
 {
     ksoftirqd_run_begin();
     if (local_softirq_pending()) {
-        handle_softirqs(true);
+        handle_softirqs(true);           // 参数 true 表示在 ksoftirqd 中执行
         ksoftirqd_run_end();
-        cond_resched();               // 让出 CPU 给其他进程
+        cond_resched();                  // 处理完让出 CPU
         return;
     }
     ksoftirqd_run_end();
 }
 ```
 
-ksoftirqd 是一个 per-CPU 内核线程（`ps` 中可见 `ksoftirqd/0`、`ksoftirqd/1`），通过 `smp_softirq_threads` 结构体注册（`kernel/softirq.c:970`）：
+ksoftirqd 通过 `smpboot_register_percpu_thread` 注册（`kernel/softirq.c:970`）。
+
+**总结`invoke_softirq` 在整个路径中的角色：** 它是 `__irq_exit_rcu` → 执行 softirq 之间的**输出端决策点**——决定是直接执行（路径 A）还是唤醒 ksoftirqd（路径 B）：
 
 ```c
-static struct smp_hotplug_thread softirq_threads = {
-    .store          = &ksoftirqd,
-    .thread_should_run = ksoftirqd_should_run,
-    .thread_fn      = run_ksoftirqd,
-    .thread_comm    = "ksoftirqd/%u",
-};
-```
-
-`ksoftirqd_should_run` 的判断很简单——`local_softirq_pending()` 不为 0（`softirq.c:919`）。
-
-**ksoftirqd 与 invoke_softirq 的关系：**
-
-`invoke_softirq()` 在 `__irq_exit_rcu()` 中被调用（`kernel/softirq.c:642`）：
-
-```c
-// 非 PREEMPT_RT 版本
-// kernel/softirq.c:425
+// kernel/softirq.c:425 (非 PREEMPT_RT)
 static inline void invoke_softirq(void)
 {
     if (!force_irqthreads() || !__this_cpu_read(ksoftirqd)) {
-        __do_softirq();           // 直接执行（默认路径）
+        __do_softirq();           // → 路径 A：直接执行（默认）
     } else {
-        wakeup_softirqd();        // threadirqs 内核参数
+        wakeup_softirqd();        // → 路径 B：交给 ksoftirqd
     }
 }
 ```
 
-**默认路径是在中断返回时直接执行 `__do_softirq()`。** 这意味着 softirq/tasklet 紧贴中断顶半部执行——中断返回前就处理完了。只有在 `threadirqs` 内核参数（`force_irqthreads`）被设置时，才强制交给 ksoftirqd。
+`if (!force_irqthreads() || !__this_cpu_read(ksoftirqd))` 走路径 B 需要**两个条件同时为真**：
+
+| `force_irqthreads()` | `__this_cpu_read(ksoftirqd)` | 走哪条路 |
+|---------------------|-----------------------------|---------|
+| false（默认） | 无所谓 | 路径 A：直接执行 |
+| true | false（ksoftirqd 还没创建）| 路径 A：直接执行 |
+| true | true（ksoftirqd 已创建）| **路径 B：唤醒 ksoftirqd** |
+
+所以走路径 B 的唯一场景是：**内核参数 `threadirqs` 被设置，且当前 CPU 的 ksoftirqd 线程已创建**。默认情况下 `force_irqthreads()` 为 false，条件永远为 true，`invoke_softirq` 永远不会调 `wakeup_softirqd()`。
+
+那靠什么触发路径 B？**不是靠 `invoke_softirq`**，而是另外两处直接调 `wakeup_softirqd()` 的入口：
+
+1. `handle_softirqs` 超限（2ms/10次）→ 直接 `wakeup_softirqd()`
+2. `raise_softirq_irqoff` 在进程上下文 → 直接 `wakeup_softirqd()`
+
+这两处不经过 `invoke_softirq`。`invoke_softirq` 只在 `__irq_exit_rcu` 中调用（中断返回路径），它只是用 `threadirqs` 参数提供了一个**兜底开关**——强制把"中断返回时直接执行"也改为线程化。
+
+与 `raise_softirq`（输入端）不同——`raise_softirq` 看的是"谁调的我"（中断/进程上下文），`invoke_softirq` 看的是"系统配置"（是否设了 `threadirqs` 内核参数）。两者独立决策，但共同决定了 softirq 最终在哪个上下文中执行。
 
 ### 2.7 初始化：softirq_init
 
@@ -597,6 +760,24 @@ static inline void tasklet_hi_schedule(struct tasklet_struct *t)
 
 ### 3.3 执行：tasklet_action
 
+`tasklet_action` 是 `TASKLET_SOFTIRQ` 向量的 action 回调，`tasklet_hi_action` 是 `HI_SOFTIRQ` 向量的回调。两者调用同一个函数 `tasklet_action_common`，只是传入的链表头和 softirq 编号不同：
+
+```c
+// kernel/softirq.c:814
+static __latent_entropy void tasklet_action(struct softirq_action *a)
+{
+    tasklet_action_common(a, this_cpu_ptr(&tasklet_vec), TASKLET_SOFTIRQ);
+}
+
+// kernel/softirq.c:819
+static __latent_entropy void tasklet_hi_action(struct softirq_action *a)
+{
+    tasklet_action_common(a, this_cpu_ptr(&tasklet_hi_vec), HI_SOFTIRQ);
+}
+```
+
+核心逻辑在 `tasklet_action_common`：
+
 ```c
 // kernel/softirq.c:769
 static void tasklet_action_common(struct softirq_action *a,
@@ -605,61 +786,149 @@ static void tasklet_action_common(struct softirq_action *a,
 {
     struct tasklet_struct *list;
 
+    /* ── ① 摘下当前 CPU 的整个 tasklet 链表 ── */
     local_irq_disable();
-    list = tl_head->head;                 // ① 摘下整个链表
-    tl_head->head = NULL;
-    tl_head->tail = &tl_head->head;
+    list = tl_head->head;              // 取链表头
+    tl_head->head = NULL;              // 清空链表
+    tl_head->tail = &tl_head->head;    // tail 指向 head（空链表状态）
     local_irq_enable();
+    // ★ 为什么摘下整个链表而非逐个取？
+    //    ① 开中断后新调度的 tasklet 会挂入空的链表，不会和当前正在处理的混在一起
+    //    ② 加锁粒度最小——只在摘链表时关中断，处理过程中中断是开的
+    //    ③ 未执行完的 tasklet（RUN 锁被占）可以重入空链表末尾
 
+    /* ── ② 遍历链表 ── */
     while (list) {
         struct tasklet_struct *t = list;
         list = list->next;
 
-        if (tasklet_trylock(t)) {         // ② 尝试获取 RUN 锁
-            if (!atomic_read(&t->count)) { // ③ count=0（使能状态）才执行
+        if (tasklet_trylock(t)) {      // 尝试获取 RUN 锁（SMP 串行化关键）
+            // test_and_set_bit(TASKLET_STATE_RUN)
+            // 返回 0 → 获取锁成功，继续
+            // 返回 1 → 其他 CPU 正在执行 → 走 else 分支
+
+            if (!atomic_read(&t->count)) {
+                // count=0：使能状态，可以执行
                 if (tasklet_clear_sched(t)) {
+                    // 清除 SCHED 标志，然后执行回调
                     if (t->use_callback)
-                        t->callback(t);   // 新接口
+                        t->callback(t);         // 新接口
                     else
-                        t->func(t->data); // 旧接口
+                        t->func(t->data);       // 旧接口
                 }
-                tasklet_unlock(t);
+                tasklet_unlock(t);    // 释放 RUN 锁
                 continue;
             }
+            // count>0：被 tasklet_disable 禁用了
+            // 不解锁 SCHED，保持"已调度"状态，等 enable 后重新触发
             tasklet_unlock(t);
         }
-
-        // ④ RUN 锁被其他 CPU 持有 → 重入链表
+        /* ── ③ RUN 锁被其他 CPU 持有 ── */
+        // 同一个 tasklet 正在另一个 CPU 上执行
+        // 不能跳过——这个 tasklet 还需要被执行
+        // 将其重入链表尾部，等下次 softirq 触发
         local_irq_disable();
         t->next = NULL;
-        *tl_head->tail = t;
+        *tl_head->tail = t;            // 挂入链表末尾
         tl_head->tail = &t->next;
-        __raise_softirq_irqoff(softirq_nr);
+        __raise_softirq_irqoff(softirq_nr);  // 重新触发 softirq
         local_irq_enable();
+        // ★ 这个重新触发保证：被其他 CPU 占用的 tasklet 不会丢，
+        //    等 RUN 锁释放后，下次 softirq 会再次尝试执行它
     }
 }
 ```
 
 **串行化原理**（这也是 tasklet 与直接使用 softirq 的核心区别）：
 
+tasklet 的串行化靠的是 `tasklet_struct` 的 `state` 字段中的两个标志位配合：
+
+```c
+// include/linux/interrupt.h:684
+enum
+{
+    TASKLET_STATE_SCHED,      // bit 0：已调度，等待执行
+    TASKLET_STATE_RUN         // bit 1：正在执行（SMP）
+};
+```
+
+**`tasklet_trylock` — 原子的 test_and_set_bit：**
+
+```c
+// include/linux/interrupt.h:691
+static inline int tasklet_trylock(struct tasklet_struct *t)
+{
+    return !test_and_set_bit(TASKLET_STATE_RUN, &(t)->state);
+}
+```
+
+`test_and_set_bit` 是 CPU 提供的一条原子指令（ARM64 上对应 `LDX`/`STX` 指令对）：
+1. **原子地**读取 `t->state` 的 bit 1
+2. **原子地**将 bit 1 置为 1
+3. 返回 bit 1 的**旧值**
+
+| 旧值 | 返回值 | `!返回值` | 含义 |
+|------|--------|----------|------|
+| 0（没人在执行）| 0 | **1 = true** | 获取锁成功——可以执行 |
+| 1（别人在执行）| 1 | **0 = false** | 获取锁失败——重入链表 |
+
+因为是**原子操作**，两个 CPU 同时调 `tasklet_trylock(t)` 时：
+
+```
+CPU0：test_and_set_bit(RUN)          CPU1：test_and_set_bit(RUN)
+  读 t->state bit 1 = 0                读 t->state bit 1 = 1
+  写 t->state bit 1 = 1（成功）          写 t->state bit 1 = 1（已=1，不变）
+  返回 0 → 获取锁                       返回 1 → 失败
+  → 执行 callback                      → 重入链表
+```
+
+`test_and_set_bit` 保证了**读和写之间不会被其他核打断**——不可能两个 CPU 同时读到 0。这就是串行化的硬件基础。
+
+**`tasklet_clear_sched` — SCHED 标志的清除：**
+
+```c
+// kernel/softirq.c:755
+static bool tasklet_clear_sched(struct tasklet_struct *t)
+{
+    if (test_and_clear_bit(TASKLET_STATE_SCHED, &t->state)) {
+        wake_up_var(&t->state);      // 唤醒 tasklet_kill 的等待者
+        return true;
+    }
+    ...
+    return false;
+}
+```
+
+同样用原子的 `test_and_clear_bit` 清除 SCHED 标志。`tasklet_kill` 通过等待 SCHED 标志清除来确认 tasklet 不会再执行。
+
+**`tasklet_unlock` — RUN 锁的释放：**
+
+```c
+void tasklet_unlock(struct tasklet_struct *t)
+{
+    smp_mb__before_atomic();         // 保证 callback 的写操作在解锁前对其他核可见
+    clear_and_wake_up_bit(TASKLET_STATE_RUN, &t->state);
+}
+```
+
+清除 RUN 位后，其他 CPU 上等待该 tasklet 的 `tasklet_trylock` 才能成功，从而在下次 softirq 中执行重入链表中的这个 tasklet。
+
 ```
 CPU0                              CPU1
 ───                               ───
 tasklet_schedule(t)               tasklet_schedule(t)
-  → SCHED=1, 挂入 CPU0 链表         → SCHED 已置位 → 跳过
+  → SCHED=1，挂入 CPU0 链表         → SCHED 已置位 → 跳过
 ↓                                 ↓
 softirq 触发                       softirq 触发
   → tasklet_action                  → tasklet_action
     → 摘下链表                        → 摘下自己的链表（不同 CPU）
     → tasklet_trylock(t)             → tasklet_trylock(t)
-      → test_and_set_bit(RUN)=0       → test_and_set_bit(RUN)=1 失败！
-      → 执行 callback                  → 重入链表，重新触发
-      → clear SCHED+RUN
+      → RUN=0，取锁成功               → RUN=1，取锁失败！
+      → 执行 callback                  → 重入链表末尾，重新触发 softirq
+      → clear RUN+SCHED
 ```
 
-- `tasklet_trylock` 基于 `test_and_set_bit(TASKLET_STATE_RUN)`（`include/linux/interrupt.h:691`），保证同一时刻最多一个 CPU 在执行同一个 tasklet
-- 如果另一个 CPU 已经在执行，当前 CPU 把 tasklet 放回链表，重新触发 softirq，等待下一次机会
-- 不同类型的 tasklet 不互斥——它们只是挂在同一个链表上的不同节点，可以被不同 CPU 并行执行
+`tasklet_trylock` 基于 `test_and_set_bit(TASKLET_STATE_RUN)`，保证**同一个 tasklet 在同一时刻最多在一个 CPU 上执行**。不同类型的 tasklet（不同的 tasklet_struct 实例）不互斥——它们只是在同一个链表上的不同节点，可以分别在 CPU0 和 CPU1 上并行执行。
 
 **两种优先级：**
 
