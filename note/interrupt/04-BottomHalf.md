@@ -1048,8 +1048,6 @@ tasklet 的问题——它在 softirq context 中执行，不能 sleep。workque
 
 v3.2 之前的旧式 workqueue：每个 workqueue 一个内核线程。
 
-v3.2 之前的旧式 workqueue：每个 workqueue 一个内核线程。
-
 ```
 旧式：workqueue = 内核线程
   workqueue_1 → kthread_worker_1
@@ -1078,69 +1076,127 @@ workqueue_struct（接口层：驱动看到的东西）
 
 ### 4.3 核心数据结构
 
-workqueue 体系涉及四个结构体，从高到低四层：
+workqueue 体系由四层结构体组成。光看字段不容易理解，不如跟着一个具体的 work 走一遍。假设驱动里写了这段代码：
 
 ```c
-// include/linux/workqueue.h
+struct work_struct my_work;          // 定义一个工作项
 
-// —— 第 1 层：工作节点（具体任务）——
+INIT_WORK(&my_work, my_callback);    // 初始化：绑定回调函数
+
+schedule_work(&my_work);             // 调度它
+```
+
+从 `INIT_WORK` 到 `my_callback` 被执行，my_work 会穿越四层结构体。往下逐层看：
+
+---
+
+**第 1 层：work_struct——驱动创建的工作项**
+
+```c
 struct work_struct {
-    atomic_long_t data;              // 状态标志 + pool ID
-    struct list_head entry;          // 链表节点
-    work_func_t func;                // 回调函数
+    atomic_long_t data;              // ① 状态位（pending 等）+ ② 目标 pool ID
+    struct list_head entry;          // 链表节点，用来挂入线程池的 worklist
+    work_func_t func;                // 回调函数（就是 my_callback）
 };
+```
 
-// —— 第 2 层：workqueue（驱动注册的接口）——
+`INIT_WORK(&my_work, my_callback)` 只做了一件事：把 `my_work.func` 设为 `my_callback`。`data` 和 `entry` 暂时为空，等调度时才填。
+
+`schedule_work(&my_work)` 要把 `my_work` 这个节点**挂到某个线程池的 worklist 上**，然后唤醒对应的 kworker 来取走它。怎么确定挂到哪个池？往下看第 2 层。
+
+---
+
+**第 2 层：workqueue_struct——驱动看到的"队列"**
+
+驱动不直接操作线程池，它操作的是一个 workqueue：
+
+```c
 struct workqueue_struct {
-    struct list_head pwqs;           // per-CPU pool_workqueue 链表
-    char name[WQ_NAME_LEN];          // 名称（ps 可见）
-    unsigned int flags;              // WQ_UNBOUND / WQ_FREEZABLE 等
+    struct list_head pwqs;           // 指向一组 pool_workqueue（每个 CPU 一个）
+    char name[WQ_NAME_LEN];          // 队列名，ps 里能看到（如 "events_long"）
+    unsigned int flags;              // WQ_UNBOUND / WQ_HIGHPRI 等
 };
+```
 
-// —— 第 3 层：pool_workqueue（桥梁）——
+`schedule_work(&my_work)` 用的是系统默认的 `system_wq`（一个全局 `workqueue_struct`）。你也可以用 `alloc_workqueue("my_wq", 0, 0)` 自己创建。
+
+**但 `workqueue_struct` 本身不维护 work 队列**——它没有 worklist，没有 worker 线程。它只有一个 `pwqs` 链表，保存一组 `pool_workqueue`（每 CPU 一个）。调度 work 时，实际是找到当前 CPU 对应的 `pool_workqueue`，再通过它找到 `worker_pool` 来入队。
+
+---
+
+**第 3 层：pool_workqueue——连接 workqueue 和线程池的桥梁**
+
+```c
 struct pool_workqueue {
-    struct worker_pool *pool;        // 关联的线程池
-    struct workqueue_struct *wq;     // 关联的 workqueue
-    struct list_head delayed_works;  // 延迟 work 链表
-    ...
+    struct worker_pool *pool;        // ← 关键：这个 workqueue 在本地 CPU 上应该用哪个线程池？
+    struct workqueue_struct *wq;     // 我归属于哪个 workqueue
+    struct list_head delayed_works;  // 延迟 work 暂存处
 };
+```
 
-// —— 第 4 层：worker_pool（线程池）——
+每个 `workqueue_struct` 在每个 CPU 上有一个 `pool_workqueue`：
+
+```
+system_wq（workqueue_struct）
+  │ wq->pwqs 链表
+  │
+  ├── pwq[CPU0]  → 指向 worker_pool[0]（CPU0 普通优先级线程池）
+  ├── pwq[CPU1]  → 指向 worker_pool[1]（CPU1 普通优先级线程池）
+  ├── pwq[CPU2]  → 指向 worker_pool[2]（CPU2 普通优先级线程池）
+  └── ...
+```
+
+**`pool_workqueue` 的核心作用**：告诉调度器"当前 CPU 上，我的 work 应该放进哪个线程池"。仅此而已。
+
+---
+
+**第 4 层：worker_pool——实际干活的线程池**
+
+```c
 struct worker_pool {
     spinlock_t lock;
-    struct list_head worklist;       // 待处理 work 链表
-    struct list_head workers;        // 所有 worker 线程
-    struct list_head idle_list;      // 空闲 worker
-    int nr_running;                  // 正在运行的 worker 数
+    struct list_head worklist;       // ← my_work 最终挂在这里等待执行
+    struct list_head workers;        // 属于这个池的所有 kworker 线程
+    struct list_head idle_list;      // 当前空闲的 worker
+    int nr_running;                  // 正在执行 work 的 worker 数
 };
 
 struct worker {
-    struct task_struct *task;        // 内核线程
-    struct worker_pool *pool;        // 所属线程池
-    struct list_head scheduled;      // 正在执行的 work 链表
+    struct task_struct *task;        // 内核线程（如 kworker/1:0）
+    struct worker_pool *pool;        // 我属于哪个池
+    struct list_head scheduled;      // 我当前正在执行的 work
 };
 ```
 
-**四层关系图：**
+系统上**每个 CPU 有两个 worker_pool**：normal 和 highpri。所有 workqueue 共享这些 pool。
+
+---
+
+**现在串起来，`schedule_work(&my_work)` 实际经过的路径：**
 
 ```
-workqueue_struct（你注册的接口：system_wq、my_wq）
-  │ wq->pwqs
-  │
-  ├── pool_workqueue[CPU0]
-  │     │ pwq->pool
-  │     └── worker_pool[0]（CPU0 普通优先级）
-  │           │ pool->worklist    ← 待处理的 work_struct
-  │           │ pool->workers     ← kworker/0:0, kworker/0:1
-  │           │ pool->idle_list   ← 空闲 worker
-  │
-  └── pool_workqueue[CPU1]
-        │
-        └── worker_pool[0]（CPU1 普通优先级）
-              │ ...
+驱动调 schedule_work(&my_work)
+                                       ← 假设当前在 CPU 1 上
+  → 找到 system_wq（workqueue_struct）
+  → 从 system_wq 找到 CPU1 对应的 pwq（pool_workqueue）
+  → 从 pwq->pool 找到 CPU1 的 worker_pool[1]
+  → 把 my_work 挂入 pool->worklist      ← my_work.entry 链入此链表
+  → 从 pool->idle_list 唤醒一个空闲 worker
+      → 该 worker 开始执行 worker 线程主循环
+      → 从 pool->worklist 摘下 my_work
+      → 调 my_work.func() → my_callback()  ← 回调被执行
 ```
 
-当驱动调 `queue_work(system_wq, work)` 时，work 被放入当前 CPU 对应的 `worker_pool` 的 `worklist`。然后同一个 pool 中的某个空闲 worker 被唤醒，从 worklist 中取出 work 执行。
+**四层结构体在这一步各司其职：**
+
+| 层 | 结构体 | 在这一步的实际作用 |
+|----|--------|------------------|
+| 1 | `work_struct` | 就是 **my_work 自己**，带着 func 指针在线程池间流转 |
+| 2 | `workqueue_struct` | **接口对象**，帮驱动找到当前 CPU 对应的 pwq |
+| 3 | `pool_workqueue` | **桥梁**，告诉调度器"system_wq 在 CPU1 上该用 worker_pool[1]" |
+| 4 | `worker_pool` | **真正的线程池**，维护 worklist + kworker 线程群 |
+
+这就是 CMWQ 省线程的关键：所有 workqueue 共享同一组 `worker_pool`，50 个驱动各自创建 workqueue，但 work 都往同一个 CPU 的同一个 pool 里扔，而不是每人养一个线程。
 
 ### 4.4 全局 workqueue
 
@@ -1155,10 +1211,10 @@ struct workqueue_struct *system_power_efficient_wq __read_mostly;
 
 | 全局 workqueue | 特性 | 适用场景 |
 |---------------|------|---------|
-| `system_wq` | per-CPU，普通优先级 | 默认 `schedule_work()` |
-| `system_highpri_wq` | per-CPU，高优先级 | 需要低延迟 |
-| `system_unbound_wq` | 不绑定 CPU | 避免缓存跳跃 |
-| `system_freezable_wq` | 休眠时排空 | PM 相关 |
+| `system_wq` | per-CPU，普通优先级，max_active=256 | `schedule_work()` 默认 |
+| `system_highpri_wq` | per-CPU，高优先级，max_active=256 | 需要低延迟 |
+| `system_unbound_wq` | 不绑定 CPU，max_active=512 | 避免缓存跳跃 |
+| `system_freezable_wq` | per-CPU，普通优先级，suspend 时排空 | PM 相关 |
 | `system_power_efficient_wq` | 非 CPU 绑定的省电版 | 移动设备 |
 
 驱动开发者一般只用 `system_wq`——`schedule_work()` 就是挂入 `system_wq`。
@@ -1225,33 +1281,34 @@ bool mod_delayed_work(struct workqueue_struct *wq, struct delayed_work *dwork,
 
 ```c
 // kernel/workqueue.c:2737
+// kworker/N 线程的主循环。结构很简单：醒来→取 work→执行→再醒来→没 work→睡。
 static int worker_thread(void *__worker)
 {
     struct worker *worker = __worker;
     struct worker_pool *pool = worker->pool;
 
-    set_pf_worker(true);
+    set_pf_worker(true);         // 标记为 worker 线程（PF_WQ_WORKER）
 woke_up:
-    raw_spin_lock_irq(&pool->lock);
+    raw_spin_lock_irq(&pool->lock);  // 取 pool 锁，保护 worklist
 
-    worker_leave_idle(worker);
+    worker_leave_idle(worker);       // 从空闲列表移出，标记为忙碌
 recheck:
-    if (!need_more_worker(pool))
-        goto sleep;
+    if (!need_more_worker(pool))     // worklist 为空？
+        goto sleep;                  // 没活干 → 去睡
 
     if (unlikely(!may_start_working(pool)) && manage_workers(worker))
-        goto recheck;
+        goto recheck;                // 需要创建/销毁 worker → 管理完重新检查
 
-    // 取第一个 work 执行
+    // 从 pool->worklist 取一个 work，执行回调
     process_one_work(worker, work);
-    goto woke_up;
+    goto woke_up;                    // 执行完再看有没有下一个 work
 
 sleep:
-    worker_enter_idle(worker);
-    __set_current_state(TASK_IDLE);
+    worker_enter_idle(worker);       // 标记为空闲，加入 idle_list
+    __set_current_state(TASK_IDLE);  // 设置 TASK_IDLE 状态
     raw_spin_unlock_irq(&pool->lock);
-    schedule();                       // 没有 work → 睡眠
-    goto woke_up;
+    schedule();                      // 主动让出 CPU，等 wake_up_worker 唤醒
+    goto woke_up;                    // 被唤醒后重新上锁检查
 }
 ```
 
@@ -1304,17 +1361,28 @@ workqueue_init_early();    // 早，~line 965
 workqueue_init();          // 晚，~line 1538
 ```
 
-`workqueue_init_early`（`kernel/workqueue.c:6566`）做了以下工作：
+前一节分析了数据结构和执行路径，那这些结构是什么时候创建、怎么串联起来的？初始化分两阶段完成。
 
-**① 分配 per-CPU worker_pool。** 每个 CPU 两个 pool（普通优先级 + 高优先级），调用 `init_worker_pool()` 初始化：
+`workqueue_init_early`（`kernel/workqueue.c:6566`）在 `start_kernel` 早期执行，此时内存分配可用但 kthread 还不能创建。它只做数据结构的准备：
+
+**① 分配 per-CPU worker_pool。** 回顾 §4.3：所有 work 最终落到 `worker_pool` 的 worklist 上，每个 CPU 有两个 pool。这里就是创建这些 pool：
+
+- `for_each_cpu_worker_pool(pool, cpu)` 是一个宏，展开后等价于遍历 `per_cpu(cpu_worker_pools, cpu)` 数组——每个 CPU 上有一个 `struct worker_pool` 数组，固定 2 个元素（`NR_STD_WORKER_POOLS`）
+- `std_nice[i++]` 是局部数组 `{ 0, HIGHPRI_NICE_LEVEL }`，即 `{ 0, -20 }`：索引 0 是普通优先级（nice 0），索引 1 是高优先级（nice -20）
 
 ```c
+// kernel/workqueue.c:6569
+// std_nice[0] = 0 → 普通优先级
+// std_nice[1] = -20 → 高优先级
+int std_nice[NR_STD_WORKER_POOLS] = { 0, HIGHPRI_NICE_LEVEL };
+
 // kernel/workqueue.c:6600
+// 遍历每个 CPU，每 CPU 两个 pool
 for_each_possible_cpu(cpu) {
-    for_each_cpu_worker_pool(pool, cpu) {
+    for_each_cpu_worker_pool(pool, cpu) {   // pool = &per_cpu(cpu_worker_pools, cpu)[0..1]
         BUG_ON(init_worker_pool(pool));
         pool->cpu = cpu;
-        pool->attrs->nice = std_nice[i++];  // 0 (normal) / -20 (highpri)
+        pool->attrs->nice = std_nice[i++];  // pool[0].nice=0, pool[1].nice=-20
     }
 }
 ```
@@ -1325,6 +1393,10 @@ for_each_possible_cpu(cpu) {
 
 ```c
 // kernel/workqueue.c:6638
+// alloc_workqueue(name, flags, max_active)
+//   name:      ps 中显示的队列名
+//   flags:     控制绑定 CPU、优先级、PM 行为
+//   max_active:每 CPU 最大并发 work 数（0 用默认）
 system_wq = alloc_workqueue("events", 0, 0);
 system_highpri_wq = alloc_workqueue("events_highpri", WQ_HIGHPRI, 0);
 system_long_wq = alloc_workqueue("events_long", 0, 0);
@@ -1337,7 +1409,55 @@ system_freezable_power_efficient_wq = alloc_workqueue(
     WQ_FREEZABLE | WQ_POWER_EFFICIENT, 0);
 ```
 
-每个 `alloc_workqueue` 创建一个 `workqueue_struct`，并为每个在线 CPU 创建对应的 `pool_workqueue`，关联到该 CPU 的 `worker_pool`。
+`alloc_workqueue` 的三个参数：
+
+| 参数 | 含义 |
+|------|------|
+| `name` | 队列名，`ps` 里看到的 kworker 线程名与之相关 |
+| `flags` | 见下表 |
+| `max_active` | 每 CPU 上最多同时执行多少个 work（0 = 内核默认 256） |
+
+`flags` 的常见取值：
+
+| flag | 效果 |
+|------|------|
+| `0`（无 flag） | per-CPU，普通优先级。work 在哪个 CPU 上调 `queue_work` 就在哪个 CPU 上执行 |
+| `WQ_HIGHPRI` | per-CPU，高优先级。work 放入 highpri worker_pool，优先处理 |
+| `WQ_UNBOUND` | 不绑定 CPU。work 可以迁移到空闲 CPU 执行（避免缓存 bouncing） |
+| `WQ_FREEZABLE` | 系统 suspend 时排空队列，保证 work 不会在休眠过程中执行 |
+| `WQ_POWER_EFFICIENT` | 延迟唤醒空闲 CPU，省电模式 |
+
+以 `system_wq = alloc_workqueue("events", 0, 0)` 为例，看内部做了什么（基于源码逐行跟踪）：
+
+```
+① kzalloc 分配 workqueue_struct，名称为 "events"
+② max_active = 0 → WQ_DFL_ACTIVE（256）
+③ 初始化 wq->pwqs/flusher_queue/flusher_overflow 等链表头
+④ alloc_and_link_pwqs(wq):
+     ├─ alloc_percpu(struct pool_workqueue *)       ← 分配 per-CPU 指针数组
+     │
+     └─ for_each_possible_cpu(cpu):                 ← 遍历所有 CPU
+           ├─ kmem_cache_alloc(pwq_cache)           ← 从 slab 分配 pool_workqueue
+           ├─ pool = cpu_worker_pools[cpu][0];      ← 指向 ① 中分配的普通优先级 pool
+           ├─ init_pwq(pwq, wq, pool)               ← 建立三向链接
+           │      pwq->wq = wq                      ← 桥梁→workqueue
+           │      pwq->pool = pool                  ← 桥梁→线程池
+           │      pwq->max_active = 256
+           │      pwq->nr_active = 0
+           └─ link_pwq(pwq)                         ← 加入 wq->pwqs 链表
+```
+
+完成后形成了 §4.3 那张关系图：
+
+```
+system_wq（workqueue_struct）
+  │
+  ├── cpu_pwq[CPU0] → pool_workqueue → worker_pool[CPU0][0]（普通优先级）
+  ├── cpu_pwq[CPU1] → pool_workqueue → worker_pool[CPU1][0]（普通优先级）
+  └── ...
+```
+
+注意 `worker_pool` 不是这里创建的——它们是上一节第 ① 步 `init_worker_pool()` 初始化好的静态 per-CPU 数组。`alloc_workqueue` 只是创建 `pool_workqueue` 指向它们。
 
 此时驱动已经可以调用 `schedule_work()`——work 会被挂入 pool->worklist，但因为没有 worker 线程，**work 不会被执行**，只是排队。
 
@@ -1438,31 +1558,70 @@ irq 线程被调度时（下半部）：
 
 线程化 IRQ 不是排队机制（不像 workqueue 有 worklist 排队），它是 `request_irq` 的一个可选特性。当驱动调用 `request_threaded_irq(irq, handler=NULL, thread_fn, ...)` 时，内核为这个中断创建一个**专用的内核线程**（SCHED_FIFO 实时优先级）。顶半部执行完毕后，handler 返回 `IRQ_WAKE_THREAD`，唤醒该线程执行 `thread_fn`。
 
+**线程化 IRQ 的完整生命周期（从创建到执行）：**
+
+```
+request_threaded_irq()
+  → kthread_create(irq_thread, action, "irq/%d-%s", irq, name)
+    线程被创建，但处于 STOP 状态，还没开始跑
+  → wake_up_process(action->thread)
+    线程开始运行 irq_thread：
+        → irq_thread_set_ready()        ← 通知创建者"我已就绪"
+        → sched_set_fifo()              ← 设为实时优先级
+        → irq_wait_for_interrupt()      ← 检查 IRQTF_RUNTHREAD 位
+            → 此时位还没设，调 schedule() 睡眠
+          ↓
+  ─── 线程已经睡了，等中断来唤醒 ───
+          ↑
+硬件中断触发 → 顶半部 handler → return IRQ_WAKE_THREAD
+  → __irq_wake_thread(desc, action)
+      → set_bit(IRQTF_RUNTHREAD, ...)   ← 设标志
+      → wake_up_process(action->thread) ← 唤醒 irq 线程
+          ↓
+irq_wait_for_interrupt() 返回 0（检测到 IRQTF_RUNTHREAD）
+  → 执行 thread_fn                      ← 驱动的下半部！
+  → 回到 while 循环
+    → irq_wait_for_interrupt() 再次睡眠
+          ↓
+  ─── 又睡了，等下一次中断 ───
+          ↑
+下次中断 → 同上流程 → 唤醒 → 执行 thread_fn → 又睡
+```
+
+关键点：
+- **线程创建后不是直接阻塞，而是先跑到 `irq_thread` 入口，在 `irq_wait_for_interrupt` 里才阻塞睡眠**
+- **唤醒者不是中断硬件，而是顶半部 handler**——handler 返回 `IRQ_WAKE_THREAD` 后，`__irq_wake_thread` 负责唤醒
+- 每个中断有自己独立的线程，互不干扰
+
 ### 5.3 irq_thread 执行流
 
 ```c
 // kernel/irq/manage.c:1298
+// irq_thread 是所有线程化 IRQ 的通用线程主函数。
+// 每个请求线程化中断的驱动都会创建一个独立的内核线程：
+//   action->thread = kthread_create(irq_thread, action, "irq/%d-%s", irq, name)
+// 所有线程都跑同一份 irq_thread 代码，
+// 但每个线程的 action 指针不同——它指向自己对应的 irqaction，
+// 从而找到自己的 thread_fn（驱动的底半部入口）。
 static int irq_thread(void *data)
 {
     struct callback_head on_exit_work;
-    struct irqaction *action = data;
+    struct irqaction *action = data;                      // 每个线程有自己的 action
     struct irq_desc *desc = irq_to_desc(action->irq);
     irqreturn_t (*handler_fn)(struct irq_desc *desc,
             struct irqaction *action);
 
-    irq_thread_set_ready(desc, action);
+    irq_thread_set_ready(desc, action);                   // 通知 request_threaded_irq 线程已启动
+    sched_set_fifo(current);                              // SCHED_FIFO，比普通进程优先
 
-    sched_set_fifo(current);                       // SCHED_FIFO 实时优先级
+    // 默认走 irq_thread_fn：直接调 action->thread_fn
+    handler_fn = irq_thread_fn;
 
-    if (force_irqthreads() && ...)
-        handler_fn = irq_forced_thread_fn;
-    else
-        handler_fn = irq_thread_fn;
+    while (!irq_wait_for_interrupt(action)) {             // 没 IRQTF_RUNTHREAD → 睡眠
+        irq_thread_check_affinity(desc, action);          // CPU 热插拔时检查亲和性
 
-    while (!irq_wait_for_interrupt(action)) {       // 等待 IRQTF_RUNTHREAD
-        irq_thread_check_affinity(desc, action);
-
-        action_ret = handler_fn(desc, action);       // 调 thread_fn
+        action_ret = handler_fn(desc, action);            // → irq_thread_fn(desc, action)
+                                                          //   → action->thread_fn(irq, dev_id)
         if (action_ret == IRQ_WAKE_THREAD)
             irq_wake_secondary(desc, action);
 
@@ -1472,29 +1631,61 @@ static int irq_thread(void *data)
 }
 ```
 
+**解释两个最直接的疑问：**
+
+**Q：每个 irq 线程跑的是同一个 `irq_thread` 函数吗？**
+A：是。所有线程化 IRQ 都用 `kthread_create(irq_thread, action, ...)` 创建线程，`irq_thread` 是共享的代码。但每个线程创建时传入了不同的 `action` 指针，这个 `action` 就是驱动注册时传递的 `irqaction`，其中包含了该中断专用的 `thread_fn`。
+
+**Q：`irq_thread` 怎么找到驱动的下半部入口？**
+A：通过 `action->thread_fn`。`irq_thread_fn(desc, action)` 内部就一行：
+
+```c
+ret = action->thread_fn(action->irq, action->dev_id);
+```
+
+所以整个链条是：
+
+```
+request_threaded_irq(irq, handler, thread_fn, ...)
+  → action->thread_fn = thread_fn           ← 存起来
+  → kthread_create(irq_thread, action, ...) ← 把 action 传给线程
+
+irq 被触发：
+  → handle_irq_event → handler() → return IRQ_WAKE_THREAD → 唤醒线程
+  → irq_thread()
+      → irq_thread_fn(desc, action)
+          → action->thread_fn(irq, dev_id)  ← 找到了！
+```
+
 **irq_wait_for_interrupt：**
 
 ```c
 // kernel/irq/manage.c:1056
+// irq_thread 调用的睡眠函数。本质：设 TASK_INTERRUPTIBLE → 检查 IRQTF_RUNTHREAD
+// → 没有就 schedule() 睡，有就返回 0 去干活。
 static int irq_wait_for_interrupt(struct irqaction *action)
 {
     for (;;) {
-        set_current_state(TASK_INTERRUPTIBLE);
+        set_current_state(TASK_INTERRUPTIBLE);  // 标记为可中断睡眠
 
-        if (kthread_should_stop()) {
-            if (test_and_clear_bit(IRQTF_RUNTHREAD, &action->thread_flags)) {
+        if (kthread_should_stop()) {             // kthread_stop() 被调了？
+            if (test_and_clear_bit(IRQTF_RUNTHREAD,
+                    &action->thread_flags)) {
+                // 有未处理的中断 → 先处理再退出
                 __set_current_state(TASK_RUNNING);
-                return 0;
+                return 0;                        // 给一次干活机会
             }
             __set_current_state(TASK_RUNNING);
-            return -1;          // kthread_stop 退出
+            return -1;                           // 直接退出线程
         }
 
-        if (test_and_clear_bit(IRQTF_RUNTHREAD, &action->thread_flags)) {
+        if (test_and_clear_bit(IRQTF_RUNTHREAD,
+                &action->thread_flags)) {
+            // 顶半部设了 IRQTF_RUNTHREAD → 有中断要处理
             __set_current_state(TASK_RUNNING);
-            return 0;           // 有中断要处理
+            return 0;                            // 去执行 thread_fn
         }
-        schedule();              // 睡眠等待
+        schedule();                              // 没活干，让出 CPU 睡觉
     }
 }
 ```
@@ -1523,33 +1714,74 @@ irq_thread 被唤醒：
 
 ### 5.4 IRQF_ONESHOT 设计原理
 
+回头看 §5.1 的路径图中有一条注释："`do { } while (ret == IRQ_WAKE_THREAD)` ← 循环（为什么？）"。这和 `IRQF_ONESHOT` 有关。
+
+**问题场景：电平触发的设备 + 线程化 IRQ**
+
+以 GPIO 按键为例——按下时信号线被拉低（电平有效），不松开就一直低。处理流程：
+
+```
+handle_fasteoi_irq                    ← 流控
+  → mask_irq                          ← 关中断（屏蔽 GPIO 中断）
+  → handle_irq_event
+    → handler 返回 IRQ_WAKE_THREAD    ← 唤醒 irq 线程
+  → unmask_irq                        ← 开中断！
+                                         ↓ 但按键还按着，信号线仍然是低电平
+  → GIC 立即又检测到电平有效
+  → handle_fasteoi_irq 再次被调用      ← 死循环：开→触发→开→触发...
+```
+
+不加 `IRQF_ONESHOT` 时，mask 在顶半部返回后就被打开了——电平设备信号线还没撤掉，所以立即又触发一次，形成无限循环。
+
+**解决方案：`IRQF_ONESHOT`**
+
 ```c
 // kernel/irq/manage.c:1086
+// thread_fn 返回后才 unmask，而不是顶半部返回时就 unmask
 static void irq_finalize_oneshot(struct irq_desc *desc,
                  struct irqaction *action)
 {
     if (!(desc->istate & IRQS_ONESHOT))
         return;
     if (!irqd_irq_disabled(&desc->irq_data) && (desc->istate & IRQS_ONESHOT))
-        unmask_irq(desc);     // ← thread_fn 完成后才 unmask！
+        unmask_irq(desc);     // ← thread_fn 执行完了才开中断！
 }
 ```
 
-不加 ONESHOT 的问题：
+`irq_finalize_oneshot` 在 `irq_thread_fn` 末尾被调用（上面的源码里可以看到）：
+
+```c
+static irqreturn_t irq_thread_fn(struct irq_desc *desc, struct irqaction *action)
+{
+    ret = action->thread_fn(action->irq, action->dev_id);
+    ...
+    irq_finalize_oneshot(desc, action);   // ← thread_fn 跑完后才开中断
+    return ret;
+}
+```
+
+加上 `IRQF_ONESHOT` 后的完整流程：
 
 ```
-handle_fasteoi_irq                    ← 流控
-  → mask_irq                          ← 关（EXTI IMR + GICD_ICENABLER）
-  → handle_irq_event
-    → handler 返回 IRQ_WAKE_THREAD
-  → unmask_irq                        ← 开！电平设备信号线仍然有效
-  → GIC 立即又收到相同中断
-  → handle_fasteoi_irq 再次被调用       ← 无限循环
+中断触发：
+  handle_fasteoi_irq
+    → mask_irq                          ← 关
+    → handle_irq_event
+      → handler 返回 IRQ_WAKE_THREAD
+    → 不会 unmask（因为 IRQS_ONESHOT 生效）
+    → do { } while (ret == IRQ_WAKE_THREAD) ← 原地循环等 thread_fn 完成
+
+irq 线程被调度：
+  → handler_fn(desc, action)
+    → action->thread_fn(irq, dev_id)    ← 驱动底半部执行
+    → irq_finalize_oneshot(desc, action)
+        → unmask_irq(desc)              ← ◆ 此时才开中断！
+                                           （设备已处理完，电平已恢复）
 ```
 
-ONESHOT 保证：**mask 一直保持到 thread_fn 执行完成后才 unmask**。中间 GIC 和 EXTI 的 mask 位保持，防止电平触发的设备在顶半部返回后立即再次触发同一中断。
+回到路径图的那个循环：`do { } while (ret == IRQ_WAKE_THREAD)` 是为了配合 ONESHOT——在 thread_fn 返回前，顶半部的流控不会 unmask。thread_fn 完成后 `irq_finalize_oneshot` 才开中断，这时设备端的中断条件应该已经消除了。
 
-这就是为什么**电平触发的中断必须加 `IRQF_ONESHOT`**（01 §1.2.3 解释了 API 层面的要求，这里是从内核实现层面说明原因）。
+这就是为什么**电平触发的中断必须加 `IRQF_ONESHOT`** 的原因（01 §1.2.3 从 API 层面解释了要求，这里从内核实现层面说明了原因）。
 
 ### 5.5 与 workqueue 的对比
 
