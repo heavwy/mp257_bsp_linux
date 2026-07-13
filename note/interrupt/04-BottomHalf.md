@@ -5,8 +5,8 @@
 > **前置:** [03-SourceAnalysis.md](03-SourceAnalysis.md) — 中断子系统初始化流程（GIC → EXTI → GPIO domain → request_irq）
 > **下一篇:** [05-Scenario.md](05-Scenario.md) — 消费者使用中断的情景分析
 >
-> **字数：约 24,000 词（含代码段）**
-> **建议阅读时间：60~90 分钟**
+> **字数：约 15859 字**
+> **建议阅读时间：30 分钟**
 
 ---
 
@@ -1021,32 +1021,11 @@ BH workqueue 是 tasklet 最直接的替代品：它在同一个 softirq 上下�
 
 ## 4. Workqueue
 
-### 4.1 完整路径
+### 4.1 为什么需要 workqueue
 
-workqueue 的完整执行路径：
+tasklet 解决了 softirq 的并发问题，但有一个根本限制：**不能 sleep**。如果驱动在中断下半部里需要调 `i2c_transfer`、`mutex_lock`、`copy_from_user` 这些可能调度（schedule）的操作，tasklet 做不到。需要一个在**进程上下文**中执行下半部的机制——这就是 workqueue。
 
-```
-驱动调 schedule_work(&work) 或 queue_work(wq, &work)
-  → test_and_set_bit(WORK_STRUCT_PENDING)   ← 防重入
-  → 找到当前 CPU 对应的 pool_workqueue
-  → insert_work(pwq, work, &pool->worklist)  ← 挂入线程池
-  → wake_up_worker(pool)                     ← 唤醒空闲 worker
-
-worker 线程被调度时：
-  worker_thread()
-    → process_one_work(worker, work)
-      → 从 pool->worklist 取出 work
-      → work->func(work)                    ← 执行回调！
-
-无 work 时：
-  → schedule()                              ← 睡眠等待
-```
-
-tasklet 的问题——它在 softirq context 中执行，不能 sleep。workqueue 把执行上下文从 softirq context 换成了**进程 context**——worker 线程可以 sleep、可以被抢占、持有 mutex、调用 `copy_from_user`。
-
-### 4.2 从 tasklet 到 workqueue
-
-v3.2 之前的旧式 workqueue：每个 workqueue 一个内核线程。
+v3.2 之前的 workqueue 实现很简单：每个 workqueue 创建一个内核线程。
 
 ```
 旧式：workqueue = 内核线程
@@ -1074,7 +1053,9 @@ workqueue_struct（接口层：驱动看到的东西）
 
 每个 CPU 两个 worker_pool：`normal`（普通优先级）和 `highpri`（高优先级）。系统上所有 workqueue（无论多少个）都共享这两个线程池。
 
-### 4.3 核心数据结构
+这就是 CMWQ 的顶层架构：**四层结构**。下面跟着一个具体的 work 走一遍，看每层结构体在路径里干什么。
+
+### 4.2 核心数据结构
 
 workqueue 体系由四层结构体组成。光看字段不容易理解，不如跟着一个具体的 work 走一遍。假设驱动里写了这段代码：
 
@@ -1198,7 +1179,9 @@ struct worker {
 
 这就是 CMWQ 省线程的关键：所有 workqueue 共享同一组 `worker_pool`，50 个驱动各自创建 workqueue，但 work 都往同一个 CPU 的同一个 pool 里扔，而不是每人养一个线程。
 
-### 4.4 全局 workqueue
+四层结构体及其关系已经清楚了。但驱动开发者通常不需要自己创建 workqueue——内核启动时已经预创建了若干**全局 workqueue**，足够大部分场景使用。下面看看有哪些。
+
+### 4.3 全局 workqueue
 
 ```c
 // kernel/workqueue.c:423
@@ -1219,7 +1202,9 @@ struct workqueue_struct *system_power_efficient_wq __read_mostly;
 
 驱动开发者一般只用 `system_wq`——`schedule_work()` 就是挂入 `system_wq`。
 
-### 4.5 调度：schedule_work → queue_work
+有了全局 workqueue，现在可以看 `schedule_work` 的源码实现了——上面 §4.2 从概念上追踪了 my_work 穿越四层的过程，这里看内核实际是怎么写的。
+
+### 4.4 调度：schedule_work → queue_work
 
 ```c
 // include/linux/workqueue.h:621
@@ -1277,7 +1262,9 @@ bool mod_delayed_work(struct workqueue_struct *wq, struct delayed_work *dwork,
 
 `mod_delayed_work` 的 "mod"（modify）语义：如果 work 已经在定时器等待中，重置定时器时间。gpio-keys 正是用这个实现按键防抖——连续按键时每次 reset 定时器，只有停止按键超过 debounce 时间后才真正执行 work。
 
-### 4.6 执行：worker_thread → process_one_work
+work 入队后挂在 `pool->worklist` 上，接下来谁把它取出来执行？答案是 **kworker 线程**——每个 `worker_pool` 有一组 worker 线程，它们的主循环就是 `worker_thread`。
+
+### 4.5 执行：worker_thread → process_one_work
 
 ```c
 // kernel/workqueue.c:2737
@@ -1333,22 +1320,23 @@ static void process_one_work(struct worker *worker, struct work_struct *work)
 }
 ```
 
-**STM32MP257 上运行的 worker 线程：**
+**kworker 线程名含义（STM32MP257 双核 A35）：**
 
 ```bash
 $ ps aux | grep kworker
-root        11  0.0  0.0      0     0 ?        I    xx:xx   0:00 [kworker/0:0]
-root        12  0.0  0.0      0     0 ?        I    xx:xx   0:00 [kworker/0:1H]
-root        13  0.0  0.0      0     0 ?        I    xx:xx   0:00 [kworker/1:0]
-root        14  0.0  0.0      0     0 ?        I    xx:xx   0:00 [kworker/1:1H]
-                    │                                  │
-                    │                                  └ H = highpri worker_pool
-                    └ worker 序号（动态增加）
+kworker/0:0     → CPU 0, 第 0 号 worker（普通优先级）
+kworker/0:1H    → CPU 0, 第 1 号 worker（高优先级，H=highpri）
+kworker/1:0     → CPU 1, 第 0 号 worker（普通优先级）
+kworker/1:1H    → CPU 1, 第 1 号 worker（高优先级）
 ```
 
-### 4.7 初始化：workqueue_init
+worker 线程是动态创建的。默认每个 pool 创建 1 个 worker，当 work 负载高时会通过 `manage_workers` 自动增加更多 worker（序号递增）。
 
-workqueue 的初始化分两个阶段，分别在 `start_kernel` 的不同时间点调用。
+---
+
+数据结构和执行路径都分析完了。最后一个问题：**这些结构是什么时候创建、怎么串联起来的？** 看 workqueue 的初始化流程。
+
+### 4.6 初始化：workqueue_init
 
 #### 第一阶段：workqueue_init_early
 
