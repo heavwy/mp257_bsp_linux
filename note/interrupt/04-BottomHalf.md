@@ -599,11 +599,37 @@ early_initcall(spawn_ksoftirqd);
 
 这意味着在 `start_kernel` 执行期间（`do_initcalls` 之前），**ksoftirqd 线程还不存在**。此时如果触发 softirq，raise_softirq 中的 `should_wake_ksoftirqd()` 返回 false，所以 softirq 只能在 `irq_exit_rcu` 路径中直接执行（`invoke_softirq` → `__do_softirq`）。直到 `early_initcall` 阶段 `spawn_ksoftirqd` 执行后，ksoftirqd 线程才上线，`should_wake_ksoftirqd` 才开始返回 true。
 
-softirq 机制的来龙去脉清楚了。但驱动开发者一般不直接使用 softirq——它太底层（需要考虑并发、不能 sleep）。驱动用得最多的是 **tasklet**，它是 softirq 之上的一层封装。下面分析 tasklet。
+softirq 机制的来龙去脉清楚了。但驱动开发者一般不直接使用 softirq——它太底层。原因有二。
+
+不过在分析原因之前，先弄清楚 softirq 回调是在**哪里执行的**。有两类执行场景：
+
+| 场景 | 触发路径 | 执行上下文 |
+|------|---------|-----------|
+| **中断返回路径** | 硬件中断处理完 → `irq_exit_rcu()` → `invoke_softirq()` → `__do_softirq()` | 在当前 CPU 的中断栈上直接执行，上下文是原子的（`SOFTIRQ_OFFSET` 置位，不可抢占） |
+| **ksoftirqd 线程** | ① 从中断返回时超出重试/时间预算，② 从进程上下文调用 `raise_softirq()` → `wakeup_softirqd()` | per-CPU 内核线程 `ksoftirqd/N`，虽然调度实体是进程上下文，但执行时仍设置 `SOFTIRQ_OFFSET`，依然不可抢占 |
+
+两个场景都是 **per-CPU 独立触发的**——CPU 0 的中断返回不会去处理 CPU 1 的 pending 位，CPU 1 的 ksoftirqd 线程也只消费本 CPU 的 pending 位。换句话说：**每个 CPU 各自执行自己那份 softirq 回调**。
+
+有了这个前提，再看为什么直接使用 softirq 太底层：
+
+1. **并发问题**：同一个 softirq vector（例如 `NET_RX_SOFTIRQ`）的 pending 位是 per-CPU 的，每个 CPU 各自处理自己的 pending 位。这意味着 **softirq 回调可能在多个 CPU 上同时执行**。驱动必须在回调中自己处理并发保护（spinlock、RCU 等），稍有不慎就是 race condition。
+
+2. **不能 sleep**：softirq 回调无论走哪条路径，上下文都是原子的——中断返回路径中在中断栈上直接执行，ksoftirqd 路径中也有 `SOFTIRQ_OFFSET` 防止抢占。任何可能睡眠的函数（`kmalloc(GFP_KERNEL)`、`mutex_lock`、`copy_from_user`）都会导致 kernel 崩溃。
+
+这两个限制意味着直接写一个 softirq 回调的负担很重，需要开发者对并发模型和中断上下文有很深的理解。
+
+驱动用得最多的是 **tasklet**，它是 softirq 之上的一层封装。tasklet 构建在 `TASKLET_SOFTIRQ`（第 6 号 softirq vector）之上，核心改进是 **串行化保证**——同一个 tasklet 的 callback 最多在一个 CPU 上执行，不会并发重入。实现手段就是 `tasklet_trylock()` 里的 `test_and_set_bit(TASKLET_STATE_RUN, &t->state)`——这是一个原子操作，谁抢到 RUN 位谁执行，没抢到的 tasklet 被重新放回链表末尾稍后重试。
+
+**对驱动开发者的意义**：不需要在 callback 里写并发保护，默认就是单线程执行的。虽然仍然不能 sleep（因为底层还是 softirq 上下文），但至少不用操心重入问题。API 也简单：`DECLARE_TASKLET` + `tasklet_schedule` + `tasklet_kill` 三件套即可。
+
+下面分析 tasklet。
 
 ---
 
 ## 3. Tasklet
+
+> **⚠️ Tasklet 已废弃（Linux 5.14+）**  
+> 新代码禁止使用 tasklet。替代方案：需要原子上下文的改用 **BH workqueue**（`system_bh_wq`），需要 sleep 的改用常规 **workqueue** 或 **线程化 IRQ**。但大量现有驱动仍在使用，理解它的工作原理对阅读和维护旧代码仍然必要。详细的废弃原因见 §3.5。
 
 Tasklet 基于 softirq 的 `TASKLET_SOFTIRQ` 向量实现。它的完整执行路径：
 
@@ -711,6 +737,10 @@ static DEFINE_PER_CPU(struct tasklet_head, tasklet_hi_vec);    // 高优先级
 // include/linux/interrupt.h:709
 static inline void tasklet_schedule(struct tasklet_struct *t)
 {
+    // test_and_set_bit 原子的：读旧值→写1→返回旧值。
+    //   旧值=0 → SCHED 刚才还是 0（不在队列），放入。
+    //   旧值=1 → SCHED 早已是 1（已在队列），跳过。
+    // 这就是事件合并：N 次调用最多执行一次。
     if (!test_and_set_bit(TASKLET_STATE_SCHED, &t->state))
         __tasklet_schedule(t);
 }
@@ -718,6 +748,7 @@ static inline void tasklet_schedule(struct tasklet_struct *t)
 // kernel/softirq.c:741
 void __tasklet_schedule(struct tasklet_struct *t)
 {
+    // 选普通优先级链表 tasklet_vec（对应 TASKLET_SOFTIRQ）。
     __tasklet_schedule_common(t, &tasklet_vec, TASKLET_SOFTIRQ);
 }
 
@@ -729,13 +760,13 @@ static void __tasklet_schedule_common(struct tasklet_struct *t,
     struct tasklet_head *head;
     unsigned long flags;
 
-    local_irq_save(flags);
-    head = this_cpu_ptr(headp);
-    t->next = NULL;
-    *head->tail = t;
-    head->tail = &(t->next);
-    raise_softirq_irqoff(softirq_nr);       // → 置 pending TASKLET_SOFTIRQ bit
-    local_irq_restore(flags);
+    local_irq_save(flags);          // 关中断：禁止顶半部并发入队破坏链表
+    head = this_cpu_ptr(headp);     // 取当前 CPU 的链表头
+    t->next = NULL;                 // 新节点就是链表尾
+    *head->tail = t;                // 链入链表尾部
+    head->tail = &(t->next);        // tail 指向新的末尾空位
+    raise_softirq_irqoff(softirq_nr); // 置 pending bit，触发 softirq
+    local_irq_restore(flags);       // 恢复中断状态
 }
 ```
 
@@ -965,6 +996,26 @@ tasklet_kill(&my_tasklet);          // 确保不再调度并等待完成
 tasklet 适用于：**不需要 sleep、执行时间短（<1ms）、不需要延迟/定时、希望自动串行化避免并发问题**的推迟任务。它是驱动开发中最常用的下半部机制之一。
 
 但 tasklet 仍然受 softirq context 的约束——不可 sleep。如果推迟任务需要执行 `i2c_transfer`、`copy_from_user`、`mutex_lock` 等可能调度（schedule）的操作，tasklet 就不够用了。这时候需要 workqueue 或线程化 IRQ。
+
+### 3.5 为何废弃
+
+Tasklet 从 Linux 5.14（2021 年）起标记为 **deprecated**，新代码禁止使用。有三个根本原因：
+
+**① 不可 sleep 且不可抢占。** tasklet 跑在 softirq 上下文（`SOFTIRQ_OFFSET` 置位），同一 CPU 上无法被其他进程抢占。如果 tasklet 执行时间较长（如遍历大量 skb），会直接导致用户态进程延迟抖动。workqueue 在进程上下文中执行，调度器可以随时换出，延迟可控。
+
+**② 有 use-after-free 隐患。** tasklet 执行完回调后，还会再次访问自身的内存（检查是否需要重新调度）。如果驱动在回调中释放了 tasklet 结构体，就会触发 UAF。BH workqueue 没有这个设计缺陷——work item 执行完就结束了，不会再碰自身内存。
+
+**③ 替代方案已经成熟。**
+
+| 需求 | 替代方案 | 引入版本 |
+|------|---------|---------|
+| 需要 atomic 上下文，轻量快速 | **BH workqueue**（`system_bh_wq`） | v6.9（2024） |
+| 需要 sleep，做 I/O | **常规 workqueue**（`schedule_work` / `queue_work`） | v2.6（早已稳定） |
+| 需要更清晰的同步语义 | **线程化 IRQ**（`request_threaded_irq`） | v2.6.30（2009） |
+
+BH workqueue 是 tasklet 最直接的替代品：它在同一个 softirq 上下文中执行，但回避了 tasklet 的 UAF 问题，且提供了更完善的 flush/cancel 接口。Tejun Heo（workqueue 维护者）在 2024 年提交了 BH workqueue 实现，随后内核社区开始大规模将 tasklet 用户转换到 BH workqueue。等迁移完成后，tasklet 代码将被彻底删除。
+
+> 既然 tasklet 已废弃，为什么还要花一整节分析它？因为 **截至 Linux 6.6，内核中仍有数千处 tasklet 使用**，大量驱动（网络、块设备、MMC、DMA 等）的现有代码均依赖 tasklet。理解它的工作原理，是读懂和维护这些代码的前提。
 
 ---
 
