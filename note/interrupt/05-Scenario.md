@@ -7,8 +7,8 @@
 > **前置:** [04-BottomHalf.md](04-BottomHalf.md) — 下半部四种机制分析
 > **下一篇:** 无（系列终篇）
 >
-> **字数：约 18,000 字**
-> **建议阅读时间：60 分钟**
+> **字数：约 15,000 字**
+> **建议阅读时间：30 分钟**
 
 ---
 
@@ -592,7 +592,11 @@ generic_handle_domain_irq(gic->domain, irqnr);
 
 ### 5.6 断面 1.4：流控——handle_fasteoi_irq
 
-`handle_fasteoi_irq` 是 GIC 风格的流控函数——中断是"EOI 驱动"的：硬件自动 mask，软件只需要在恰当的时候调用 EOI。其完整代码在 `kernel/irq/chip.c:687`：
+`handle_fasteoi_irq` 是 GIC 风格中断的流控函数，全称是 **fast EOI**——硬件自动管理屏蔽，软件只需要在 handler 执行完后调用 EOI 告诉 GIC"我处理完了"。
+
+> **对照**：另一个常见的流控函数是 `handle_level_irq`，它需要软件显式 mask/unmask，因为电平触发的硬件不会自动屏蔽。这里不展开。
+
+先看代码——我把 KEY0 实际走的路径标记出来，不走的边缘路径放在后面简要说明：
 
 ```c
 // kernel/irq/chip.c:687
@@ -601,8 +605,14 @@ void handle_fasteoi_irq(struct irq_desc *desc)
     struct irq_chip *chip = desc->irq_data.chip;
 
     raw_spin_lock(&desc->lock);
+    //   ↑ irq_desc 是多 CPU 共享的（如 CPU0 调 handle_fasteoi_irq，
+    //     CPU1 同时调 disable_irq），不加锁会竞争
 
-    // ★ 安全检查：affinity 竞争导致的中断重发
+    // ┌────────────────────────────────────────────────────────────┐
+    // │ 检查①：现在这个CPU该不该处理这个中断？                      │
+    // │ 大部分时候→通过。如果另一个CPU已经在处理同个中断了          │
+    // │ （IRQD_IRQ_INPROGRESS），当前CPU跳过处理。详见下文。       │
+    // └────────────────────────────────────────────────────────────┘
     if (!irq_may_run(desc)) {
         if (irqd_needs_resend_when_in_progress(&desc->irq_data))
             desc->istate |= IRQS_PENDING;
@@ -611,23 +621,41 @@ void handle_fasteoi_irq(struct irq_desc *desc)
 
     desc->istate &= ~(IRQS_REPLAY | IRQS_WAITING);
 
-    // ★ 没注册 handler 或已被禁用 → mask 掉
+    // ┌────────────────────────────────────────────────────────────┐
+    // │ 检查②：handler被注销了(已free_irq)或被disable_irq禁用了？  │
+    // │ KEY0场景：action存在且没被禁用 → 通过                      │
+    // └────────────────────────────────────────────────────────────┘
     if (unlikely(!desc->action || irqd_irq_disabled(&desc->irq_data))) {
         desc->istate |= IRQS_PENDING;
         mask_irq(desc);
         goto out;
     }
 
-    kstat_incr_irqs_this_cpu(desc);  // 递增 /proc/interrupts 计数
+    // ★ 这行就是 /proc/interrupts 里计数加1的地方
+    kstat_incr_irqs_this_cpu(desc);
 
-    // ★ 如果标志了 IRQS_ONESHOT（线程化 IRQ），先 mask
+    // ┌────────────────────────────────────────────────────────────┐
+    // │ 检查③：是否带IRQF_ONESHOT标志（线程化IRQ用）？            │
+    // │ KEY0场景：不是线程化IRQ → 跳过 mask                       │
+    // │ 触摸屏场景：是线程化IRQ → 先mask，防止thread_fn执行期间    │
+    // │   同中断再次触发。等thread_fn返回后才unmask。              │
+    // └────────────────────────────────────────────────────────────┘
     if (desc->istate & IRQS_ONESHOT)
         mask_irq(desc);
 
-    handle_irq_event(desc);          // ★ 调用 action 链表
+    // ★ 调用 gpio_keys_gpio_isr（详见 §5.7）
+    handle_irq_event(desc);
 
-    cond_unmask_eoi_irq(desc, chip); // ★ 条件性 unmask + EOI
+    // ┌────────────────────────────────────────────────────────────┐
+    // │ 条件性EOI/unmask：                                         │
+    // │ KEY0场景：非ONESHOT → 直接 chip->irq_eoi() 写GICC_EOI     │
+    // │   （GIC收到EOI后自动解除硬件mask，不需要软件unmask）       │
+    // │ 触摸屏场景：ONESHOT+线程还在跑 → 只EOI，不unmask           │
+    // │ 触摸屏场景：ONESHOT+线程已跑完 → EOI+unmask               │
+    // └────────────────────────────────────────────────────────────┘
+    cond_unmask_eoi_irq(desc, chip);
 
+    // ※ 如果检查①标记了IRQS_PENDING，现在手动resend补发中断
     if (unlikely(desc->istate & IRQS_PENDING))
         check_irq_resend(desc, false);
 
@@ -635,118 +663,146 @@ void handle_fasteoi_irq(struct irq_desc *desc)
     return;
 
 out:
+    // 从检查①或检查②goto出来的EOI兜底
+    // 如果不EOI，GIC以为这个中断一直没处理完，不会再发新中断→死锁
     if (!(chip->flags & IRQCHIP_EOI_IF_HANDLED))
         chip->irq_eoi(&desc->irq_data);
     raw_spin_unlock(&desc->lock);
 }
 ```
 
-#### 5.6.1 EXTI 的 mask/unmask/eoi 回调
+**KEY0 实际走的路径**只用到 5 步：
 
-`mask_irq(desc)` 和随后的 `unmask_irq()`、`eoi_irq()` 最终调用的是 irq_chip 中的回调。对于经过 EXTI 的中断，这段 irq_chip 是 `stm32mp_exti_chip`：
+```
+锁 → irq_may_run(通过) → action存在(通过) → kstat++ → 非ONESHOT(跳过) → handle_irq_event → 非ONESHOT EOI → 解锁
+```
+
+剩下那些 `if` 分支都是处理边缘情况的。下面逐一说明。
+
+#### 5.6.1 三个边缘检查，用 KEY0 场景的视角理解
+
+##### 检查①：irq_may_run —— 两个 CPU 抢同一个中断
+
+用 KEY0 举例。KEY0 的默认亲和性包含 CPU0+CPU1（`cat /proc/irq/268/smp_affinity` 显示 `3`）。
+
+**不需要用户改亲和性**，只要 KEY0 连续两次按下间隔够短，GIC 就可能把第一次中断给 CPU0、第二次给 CPU1：
+
+```
+CPU0                                     CPU1
+│                                        │
+├─ 第一次按键：进入 gic_handle_irq       │
+│  → GICC_IAR=268                        │
+│  → handle_fasteoi_irq                  │
+│    → lock(desc)                         │
+│    → irq_may_run → true                │
+│    → IRQD_IRQ_INPROGRESS 置位           │
+│    → handle_irq_event                  │
+│      → unlock(desc)                    │
+│      → gpio_keys_gpio_isr()            │
+│                                        │  第二次按键，GIC 把中断发给 CPU1
+│                                        │  → GICC_IAR=268
+│                                        │  → handle_fasteoi_irq
+│                                        │  → lock(desc)
+│                                        │  → irq_may_run
+│                                        │    → IRQD_IRQ_INPROGRESS 还在
+│                                        │    → return false!
+│                                        │  → goto out
+│                                        │  → 不处理，不 EOI
+│      → lock(desc)                      │
+│    → cond_unmask_eoi_irq               │
+│    → unlock(desc)                      │
+│    → IRQD_IRQ_INPROGRESS 清除          │
+│  ── 第一次处理完成 ──                   │
+│                                        │
+│  ※ 但此时发生了什么事？                  │
+│  → check_irq_resend(IRQS_PENDING)      │
+│  → 写 GICD_ISPENDR ← 软件重触发        │
+│  → GIC 重新发中断                       │
+│                                        │
+├─ GIC 第三次发中断（重触发）             │
+│  → 正常处理                             │
+```
+
+CPU1 发现"CPU0 正在处理同个中断"，**放弃处理**。内核检查 GIC 是否支持软件重触发——GIC-400 支持写 `GICD_ISPENDR` 的对应 bit 来重触发一个 SPI。所以标记 `IRQS_PENDING`，等 CPU0 处理完后走 `check_irq_resend` 补发中断。边沿触发的中断，如果不补发，**这次按键就丢了**。
+
+> **用生活场景理解**：你和同事在同一个柜台排队（smp_affinity 包含两人）。叫号系统喊了"268号"——你在处理了。但同事的号码牌上也是 268（另一个中断），他一看"268 已经在处理了"，就放弃了。等他处理完手头的事，再让叫号系统重新喊一次 268。
+
+##### 检查②：!action / irqd_irq_disabled —— handler 被注销或被禁用
+
+**情景 A（handler 已注销）**：驱动调了 `free_irq(268)`，但 GIC 层面的中断使能还没关（`synchronize_irq` 还在等所有 CPU 同步完）。在同步完成前，EXTI 又检测到一次按键边沿——GIC 把中断发给 CPU，但 `irq_desc[268].action` 已经是 NULL 了。没有 handler 可以处理 → `mask_irq` 屏蔽掉。
+
+**情景 B（被 disable_irq 禁用）**：驱动调了 `disable_irq(268)`。`disable_irq` 只是把 `irq_desc.depth` 加 1，真正的 GICD_ICENABLER 写入会**延迟**到同步时。在同步之前中断飞来 → 检查到 `irqd_irq_disabled` → mask。
+
+两种情况都设了 `IRQS_PENDING`：下次 `enable_irq` 时看到这个标志，会补发一次中断。
+
+##### 检查③：IRQS_ONESHOT —— 防止线程化 IRQ 的重入
+
+这个发生在第二幕的触摸屏场景。详细原理在 §5.15 展开，这里只讲为什么需要它：
+
+对于 KEY0（非线程化）：handler 在 IRQ 栈上执行几微秒就返回了。GIC 硬件自动管理 mask，EOI 后解除。
+
+对于触摸屏（线程化）：handler 返回 `IRQ_WAKE_THREAD` 后，真正的处理（`i2c_transfer`）在独立的线程中执行。如果线程执行期间不 mask，中断再次触发 → handler 又跑一次 → `__irq_wake_thread` 发现 `IRQTF_RUNTHREAD` 已经置位（线程还在忙）→ 什么都不做。**中断丢失**。
+
+`IRQS_ONESHOT` 在 handler 返回前就 mask 了中断线，等 `irq_finalize_oneshot`（线程处理完）才 unmask——保证线程处理期间不会丢中断。
+
+#### 5.6.2 EXTI 的 mask/unmask/eoi 回调
+
+`mask_irq()`、`unmask_irq()`、`chip->irq_eoi()` 最终调到的是 STM32MP257 EXTI 驱动注册的回调：
 
 ```c
 // irq-stm32mp-exti.c:520
 static struct irq_chip stm32mp_exti_chip = {
     .name           = "stm32mp-exti",
-    .irq_eoi        = stm32mp_exti_eoi,
-    .irq_mask       = stm32mp_exti_mask,
-    .irq_unmask     = stm32mp_exti_unmask,
+    .irq_eoi        = stm32mp_exti_eoi,      // ★ EOI: 清 RPR/FPR + 委托 GIC
+    .irq_mask       = stm32mp_exti_mask,     // ★ mask: 清 mask_cache + 委托 GIC
+    .irq_unmask     = stm32mp_exti_unmask,   // ★ unmask: 置 mask_cache + 委托 GIC
     .irq_set_type   = stm32mp_exti_set_type,
     .irq_set_affinity = irq_chip_set_affinity_parent,
-    ...
 };
 ```
 
-**stm32mp_exti_mask** — 写 mask_cache 并委托父级（GIC）：
+三个回调的调用链如下：
 
-```c
-// irq-stm32mp-exti.c:376
-static void stm32mp_exti_mask(struct irq_data *d)
-{
-    struct stm32mp_exti_chip_data *chip_data = irq_data_get_irq_chip_data(d);
-    const struct stm32mp_exti_bank *bank = chip_data->reg_bank;
-
-    raw_spin_lock(&chip_data->rlock);
-    chip_data->mask_cache &= ~stm32mp_exti_clr_bit(d, bank->imr_ofst); // 清除 cache bit
-    raw_spin_unlock(&chip_data->rlock);
-
-    irq_chip_mask_parent(d);  // 委托 GIC 进行真实的 mask
-}
+```
+handle_fasteoi_irq 中的调用              EXTI 回调                  GIC 回调
+─────────────────────────              ─────────                  ────────
+mask_irq(desc)            → stm32mp_exti_mask()    → irq_chip_mask_parent() → GICD_ICENABLER
+unmask_irq(desc)          → stm32mp_exti_unmask()  → irq_chip_unmask_parent() → GICD_ISENABLER
+chip->irq_eoi(desc)       → stm32mp_exti_eoi()     → irq_chip_eoi_parent() → GICC_EOI
 ```
 
-注意 **mask_cache**：EXTI 驱动不直接写 IMR 寄存器，而是先在内存的 `mask_cache` 中将对应位清 0，然后通过 `irq_chip_mask_parent` 委托给 GIC——GIC 的 `gic_chip` 会写 GICD_ICENABLER（中断清除使能寄存器）。EXTI 的真正 IMR 写入推迟到 resume 或 EOI 时批量同步。这种"写缓存"模式在 02-§2.8 有详细分析。
-
-**stm32mp_exti_unmask** — 恢复 mask_cache 并委托父级：
+**stm32mp_exti_eoi 的完整动作**（`irq-stm32mp-exti.c:359`）：
 
 ```c
-// irq-stm32mp-exti.c:388
-static void stm32mp_exti_unmask(struct irq_data *d)
-{
-    ...
-    chip_data->mask_cache |= stm32mp_exti_set_bit(d, bank->imr_ofst);
-    ...
-    irq_chip_unmask_parent(d);
-}
-```
-
-**stm32mp_exti_eoi** — 清 pending + 恢复 mask_cache + 委托 EOI：
-
-```c
-// irq-stm32mp-exti.c:359
 static void stm32mp_exti_eoi(struct irq_data *d)
 {
-    struct stm32mp_exti_chip_data *chip_data = irq_data_get_irq_chip_data(d);
-    const struct stm32mp_exti_bank *bank = chip_data->reg_bank;
-
-    raw_spin_lock(&chip_data->rlock);
-
-    // ★ 写 RPR 清上升沿 pending（寄存器写 1 清 0）
-    stm32mp_exti_write_bit(d, bank->rpr_ofst);
-    // ★ 写 FPR 清下降沿 pending
-    stm32mp_exti_write_bit(d, bank->fpr_ofst);
-
-    // ★ 恢复 mask_cache（之前被 mask 清掉的 bit 重新置 1）
+    // 步骤 1：清 RPR（上升沿 pending 寄存器）
+    stm32mp_exti_write_bit(d, bank->rpr_ofst);  // 写 1 清 0
+    // 步骤 2：清 FPR（下降沿 pending 寄存器）
+    stm32mp_exti_write_bit(d, bank->fpr_ofst);  // 写 1 清 0
+    // 步骤 3：恢复 mask_cache——之前 mask 操作清掉的 bit 重新置 1
     chip_data->mask_cache |= stm32mp_exti_set_bit(d, bank->imr_ofst);
-
-    raw_spin_unlock(&chip_data->rlock);
-
-    // ★ 委托 GIC 写 GICC_EOI
+    // 步骤 4：委托 GIC 写 GICC_EOI
     irq_chip_eoi_parent(d);
 }
 ```
 
-EOI 做了三件事：
-1. **清 RPR/FPR** —— 告诉 EXTI：这个中断事件已经处理完了，可以接收下一次边沿检测
-2. **恢复 mask_cache** —— mask 阶段清除的 cache bit 重新置 1（使能下次中断）
-3. **irq_chip_eoi_parent** —— 去调 GIC 的 EOI 回调，写 GICC_EOI 寄存器
+第 1–2 步清掉了 EXTI 侧的 pending 标志（`RPR1 bit5` 或 `FPR1 bit5`），告诉 EXTI 控制器这个边沿事件已处理。
 
-在 STM32MP257 上，因为 GIC-400 不支持 split EOI（`supports_deactivate_key = false`），GIC 的 `irq_eoi` 回调就是写 `GICC_EOI`（偏移 0x10）：
+第 3 步恢复了 `mask_cache`。mask_cache 是 EXTI 驱动的**写缓存优化**：EXTI 驱动不直接写 IMR 寄存器，所有 mask/unmask 操作先改内存里的 `mask_cache`，通过 `irq_chip_mask_parent` 委托 GIC 去操作 GICD_ICENABLER。真正的 EXTI IMR 寄存器写入只在 suspend/resume 时批量同步（详见 02-§2.8）。
+
+第 4 步委托 GIC。GIC-400 的 `irq_eoi` 回调就是写 `GICC_EOI` 寄存器（偏移 0x10）：
 
 ```c
 // irq-gic.c:231
 static void gic_eoi_irq(struct irq_data *d)
 {
     writel_relaxed(irq_data_get_irq_chip_data(d), GIC_CPU_EOI);
+    //                             ↑ hwirq 值直接写回 GICC_EOI
 }
 ```
 
-#### 5.6.2 KEY0 在 handle_fasteoi_irq 中的实际流控序列
-
-对于 gpio-keys 驱动（**非 ONESHOT，非线程化**），handle_fasteoi_irq 中的序列是：
-
-```
-① irq_may_run 检查          → 通过
-② 无 action 或 disabled 检查 → 通过（action 已注册）
-③ kstat_incr_irqs_this_cpu  → /proc/interrupts 计数+1
-④ IRQS_ONESHOT 检查         → 否，跳过 mask
-⑤ handle_irq_event(desc)    → ★ 调用 action->handler
-⑥ cond_unmask_eoi_irq(desc, chip):
-     └─ !IRQS_ONESHOT        → 直接 chip->irq_eoi() ← EXTI EOI
-⑦ 检查 IRQS_PENDING         → 否，结束
-```
-
-**步骤 ⑥ 的 cond_unmask_eoi_irq 是关键**——对于非 ONESHOT 中断，它只调 `chip->irq_eoi()`，不需要 unmask（因为 handle_fasteoi 假设硬件会自动屏蔽，EOI 后自动解除屏蔽）。
+至此，从 EXTI 到 GIC 的处理标记全部清除，中断线可以再次触发了。
 
 ---
 
@@ -1038,7 +1094,63 @@ Event: time 1623456799.654321, type 0 (EV_SYN), code 0 (SYN_REPORT), value 0
 
 ---
 
-### 5.11 第一幕路径全景总结（见本章末尾的完整对比表）
+### 5.11 第一幕路径全景总结
+
+```
+PH5 按下（电平变化）
+  │
+  ├─ 硬件层                                    §5.3
+  │    GPIOH pin 5 → EXTI FPR1 bit5 置位 → GIC SPI 273
+  │
+  ├─ GIC Distributor → CPU Interface           §5.3
+  │    GICD_ISENABLER 检查 → GICC_IAR 可读 → nIRQ 断言
+  │
+  ├─ ARM64 异常入口                            §5.4
+  │    VBAR_EL1 → vectors[5] → kernel_ventry → kernel_entry
+  │    → el1h_64_irq_handler → __el1_irq
+  │    → irq_enter_rcu → do_interrupt_handler
+  │    → on_thread_stack? → call_on_irq_stack（切IRQ栈）
+  │    → gic_handle_irq
+  │
+  ├─ GIC 主循环                                §5.5
+  │    do { readl(GICC_IAR=0x0C) → ID=273
+  │         generic_handle_domain_irq(domain, 273)
+  │    } while(irqnr < 1020)
+  │
+  ├─ 流控：handle_fasteoi_irq                  §5.6
+  │    5步：lock → irq_may_run → action存在
+  │    → kstat_incr → 非ONESHOT(跳过mask)
+  │    → handle_irq_event → cond_unmask_eoi_irq
+  │    → EXTI EOI(RPR/FPR) → GIC EOI → unlock
+  │
+  ├─ handle_irq_event                          §5.7
+  │    unlock(desc) → __handle_irq_event_percpu
+  │    → action->handler(268, dev_id)
+  │
+  ├─ 顶半部：gpio_keys_gpio_isr                §5.7
+  │    mod_delayed_work(system_wq, work, 10ms)
+  │    或 hrtimer_start(debounce_timer, 10ms)
+  │    return IRQ_HANDLED
+  │
+  ├─ 中断退出：irq_exit_rcu                    §5.8
+  │    preempt_count_sub(HARDIRQ_OFFSET)
+  │    local_softirq_pending()=false → eret
+  │    （workqueue 不走 softirq）
+  │
+  ├─ 下半部：workqueue / hrtimer（10ms后）     §5.9
+  │    worker 线程被调度 或 hrtimer 到期
+  │    gpio_keys_gpio_work_func / gpio_keys_debounce_timer
+  │    → gpiod_get_value[_cansleep](PH5)
+  │    → gpio_keys_gpio_report_event
+  │    → input_event(EV_KEY, KEY_0, state)
+  │    → input_sync()
+  │
+  └─ 用户态                                    §5.10
+       evtest /dev/input/event0
+       struct input_event { EV_KEY, KEY_0, 1/0 }
+```
+
+完整的两幕对比表见 §5.18。
 
 ---
 
@@ -1048,106 +1160,114 @@ Event: time 1623456799.654321, type 0 (EV_SYN), code 0 (SYN_REPORT), value 0
 
 #### 5.12.1 第二个问题
 
-ATK 板上有一块 **FT6336**（或类似 FT6x36 系列）电容触摸屏，通过 **I2C2** 总线与 SoC 通信。触摸屏的中断引脚连接到 SoC 的某个 GPIO（通常是 EXTI 事件），中断触发后驱动需要通过 I2C 读取触摸坐标。
+ATK BSP 板上用的触摸屏是 **Goodix GT9271**（兼容器件 GT911），通过 **I2C2** 总线与 SoC 通信。中断引脚接在 **GPIOB2** 上，中断触发后驱动需要通过 I2C 读取触摸坐标。
 
 **问题是**：同样是"外设触发中断→驱动读取数据→上报 input 事件"的模式，为什么触摸屏驱动不使用 gpio-keys 那样的 workqueue，而必须使用**线程化 IRQ**？
 
 答案在 04-§5.1 已经说过：**I2C 传输需要 sleep**。`i2c_transfer()` 内部需要等待硬件 ACK、等待 DMA 完成，这些等待机制都基于调度——意味着调用者必须处于进程上下文。workqueue 虽然也是进程上下文，但 workqueue 是共享线程池，而线程化 IRQ 为每路中断创建**专用内核线程**（`irq/N-xxx`），提供更好的实时性和确定性。
 
-所以触摸屏驱动的选择是：
-
-| 需求 | 方案 |
-|------|------|
-| 顶半部不能 sleep，但需要快速确认中断来源 | 轻量级顶半部（读 GPIO 状态寄存器）→ return IRQ_WAKE_THREAD |
-| 底半部需要 i2c_transfer（sleep） | 专用内核线程 irq_thread → thread_fn |
-| 中断再次触发时，必须等待前一次 I2C 传输完成 | IRQF_ONESHOT 标志（传输完成前不 unmask） |
+但 Goodix 驱动的具体做法和第一印象有些不同——**它完全不要顶半部**。全部工作直接在 irq_thread 中完成：
 
 #### 5.12.2 I2C 触摸屏的中断路径
 
-触摸屏的中断连接与 KEY0 不同。KEY0 是 GPIO 按键，中断经过 GPIO→EXTI→GIC 三级。I2C 触摸屏的中断连接方式取决于硬件设计。两种可能：
+触摸屏的中断连接与 KEY0 不同。KEY0 是 GPIO 按键，中断经过 GPIO→EXTI→GIC 三级。查询 ATK BSP 板 DTS（`stm32mp257d-atk-bsp.dts:522`），触摸屏用的是 **Goodix GT9271/GT911**，中断引脚接在 **GPIOB2** 上：
 
-- **方式 A：触摸屏 INT 引脚直接连到 SoC GPIO** → 与 KEY0 一样走 GPIO→EXTI→GIC
-- **方式 B：触摸屏 INT 引脚连到 I2C 控制器的中断输出** → I2C 控制器直连 GIC
+```dts
+goodix_ts@14 {
+    compatible = "goodix,gt9271", "goodix,gt911";
+    reg = <0x14>;
+    interrupt-parent = <&gpiob>;          // 中断父节点是 GPIOB
+    interrupts = <2 IRQ_TYPE_EDGE_RISING>; // PB2，上升沿触发
+    irq-gpios = <&gpiob 2 GPIO_ACTIVE_HIGH>;
+    reset-gpios = <&gpiob 1 GPIO_ACTIVE_HIGH>;
+};
+```
 
-ATK 板上的具体连接取决于原理图，但无论哪种方式，**中断的前半段路径**（硬件→GIC→entry.S→gic_handle_irq→handle_fasteoi_irq→handle_irq_event）与第一幕完全相同。
+`interrupt-parent = <&gpiob>` 表明触摸屏的中断信号路径是：
 
-**关键区别在顶半部和返回路径上**。
+```
+触摸屏 INT → GPIOB2 → GPIOB irq_domain → EXTI domain → GIC domain
+```
+
+**与 KEY0 一样走 GPIO→EXTI→GIC 三级路径**，只是 GPIO bank 和 pin 不同（KEY0 是 PH5，触摸屏是 PB2）。所以中断的前半段路径（硬件→GIC→entry.S→gic_handle_irq→handle_fasteoi_irq→handle_irq_event）与第一幕完全相同，本节不再重复。
 
 #### 5.12.3 request_threaded_irq 的注册
 
-触摸屏驱动在 probe() 中调用：
+Goodix 驱动的注册代码（`goodix.c:513`）：
 
 ```c
-// 典型触摸屏驱动的 request_threaded_irq 调用
-error = devm_request_threaded_irq(&client->dev, client->irq,
-                  ft6x36_irq_handler,   // top half
-                  ft6x36_irq_thread_fn, // thread fn
-                  IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
-                  "ft6x36", client);
-if (error)
-    dev_err(&client->dev, "request irq failed: %d\n", error);
+static int goodix_request_irq(struct goodix_ts_data *ts)
+{
+    return devm_request_threaded_irq(&ts->client->dev, ts->client->irq,
+                     NULL,                         // handler = NULL ← 无顶半部！
+                     goodix_ts_irq_handler,          // thread_fn
+                     ts->irq_flags, ts->client->name, ts);
+}
 ```
 
 这里与 gpio-keys 注册的区别：
 
 | 参数 | gpio-keys | 触摸屏 |
 |------|----------|--------|
-| handler | `gpio_keys_gpio_isr` | `ft6x36_irq_handler` |
-| thread_fn | NULL | `ft6x36_irq_thread_fn` |
-| irqflags | `IRQF_TRIGGER_RISING \| IRQF_TRIGGER_FALLING` | `IRQF_TRIGGER_FALLING \| IRQF_ONESHOT` |
+| handler | `gpio_keys_gpio_isr` | **NULL** |
+| thread_fn | NULL（无） | **`goodix_ts_irq_handler`** |
+| irqflags | `IRQF_TRIGGER_RISING \| IRQF_TRIGGER_FALLING` | `ts->irq_flags`（含 `IRQF_ONESHOT`） |
 
-`request_threaded_irq` 在 `kernel/irq/manage.c` 中实现的完整流程已经在 04-§5.2 分析过，这里只关注与运行路径直接相关的内核线程创建。
+**关键**：handler = NULL，thread_fn != NULL。内核在 `__setup_irq` 中做了个特殊处理（`manage.c:1404`）：
+
+```c
+// 当 handler == NULL 且 thread_fn != NULL 时：
+// 内核把 thread_fn 的地址同时赋给 handler，然后注册一个内部默认的 primary handler
+new->handler = irq_default_primary_handler;  // 一个只返回 IRQ_WAKE_THREAD 的 handler
+new->thread_fn = goodix_ts_irq_handler;       // 真正的工作函数
+```
+
+也就是说，内核自动生成一个"哑"顶半部——它什么都不做，只在注册时确认 `IRQTF_RUNTHREAD` 标志可被设置，然后返回 IRQ_WAKE_THREAD。真正的全部工作在 irq_thread 中由 `goodix_ts_irq_handler` 完成。
+
+`irq_default_primary_handler` 在 `manage.c` 中的定义：
+
+```c
+static irqreturn_t irq_default_primary_handler(int irq, void *dev_id)
+{
+    return IRQ_WAKE_THREAD;
+}
+```
+
+**所以触摸屏路径的本质是：硬中断 → 默认 handler (IRQ_WAKE_THREAD) → __irq_wake_thread → irq_thread → thread_fn，完全没有驱动级别的顶半部。**
 
 当 `thread_fn != NULL` 时，`__setup_irq()` 调用 `setup_irq_thread()` 创建一个内核线程：
 
 ```c
-// kernel/irq/manage.c:1561（简化）
-if (new->thread_fn && !nested) {
-    struct task_struct *t;
+// kernel/irq/manage.c:1465
+if (!secondary) {
     t = kthread_create(irq_thread, new, "irq/%d-%s", irq, new->name);
-    ...
-    new->thread = t;
-}
+} ...
+new->thread = get_task_struct(t);
+set_bit(IRQTF_AFFINITY, &new->thread_flags);  // 告诉线程启动后绑定到 smp_affinity
 ```
 
 创建后的线程在 `/proc` 中可见：
 
 ```
 ~# ps | grep irq/
-  125 root       0:00 [irq/269-ft6x36]
+  127 root       0:00 [irq/269-goodix]
 ```
 
 ---
 
-### 5.13 断面 2.1：顶半部——handler 的执行
+### 5.13 断面 2.1：没有顶半部——全部工作在线程中
 
-触摸屏被点击后，中断硬件路径走完，进入 `__handle_irq_event_percpu`。`action->handler` 是触摸屏驱动注册的顶半部。
+触摸屏被点击后，中断硬件路径走完，进入 `__handle_irq_event_percpu`。
 
-典型的触摸屏顶半部（伪代码简化真实驱动）：
+`action->handler` 不是驱动注册的函数，而是内核设置的 `irq_default_primary_handler`：
 
 ```c
-static irqreturn_t ft6x36_irq_handler(int irq, void *dev_id)
+// 被调用的是这个
+static irqreturn_t irq_default_primary_handler(int irq, void *dev_id)
 {
-    struct ft6x36_data *data = dev_id;
-
-    /*
-     * 顶半部只做一件事：确认中断来自本设备。
-     * 真正的 I2C 读取在 thread_fn 中完成（因为 i2c_transfer 需要 sleep）。
-     *
-     * 某些实现可能通过 GPIO 口直接读一个状态引脚来判断——这不会 sleep。
-     */
-    if (!(readl_relaxed(data->reg_base + FT6X36_REG_STATUS) & FT6X36_TP_INT))
-        return IRQ_NONE;  // 不是我们的中断
-
-    return IRQ_WAKE_THREAD;   // ← ★ 关键：唤醒线程处理
+    return IRQ_WAKE_THREAD;   // 永远返回唤醒线程
 }
 ```
-
-这个 handler 与 gpio-keys 的 handler 有三个关键区别：
-
-1. **返回值不是 IRQ_HANDLED，而是 IRQ_WAKE_THREAD**——告诉核心层"我需要唤醒一个内核线程来处理"
-2. **顶半部尽可能轻量**——只确认中断来源，不做数据读取
-3. **没有 workqueue/hrtimer 调度**——不延迟，立即唤醒线程
 
 `__handle_irq_event_percpu` 检测到 `IRQ_WAKE_THREAD` 后：
 
@@ -1159,6 +1279,8 @@ case IRQ_WAKE_THREAD:
     break;
 }
 ```
+
+**与第一幕的 key0 对比**：gpio-keys 的处理全部在顶半部完成（`gpio_keys_gpio_isr` 调 `mod_delayed_work` 后返回 `IRQ_HANDLED`）。Goodix 驱动则完全相反——顶半部是空的（只返回 `IRQ_WAKE_THREAD`），全部逻辑在 irq_thread 中执行。
 
 ---
 
@@ -1315,57 +1437,43 @@ static irqreturn_t irq_thread_fn(struct irq_desc *desc,
 }
 ```
 
-最终调用的是驱动注册的 `ft6x36_irq_thread_fn`。
+最终调用的是驱动注册的 `goodix_ts_irq_handler`。
 
-#### 5.16.3 thread_fn——真正的 I2C 读取
+#### 5.16.3 thread_fn——Goodix 驱动的实际处理
 
 ```c
-// 典型触摸屏驱动的 thread_fn（简化伪代码）
-static irqreturn_t ft6x36_irq_thread_fn(int irq, void *dev_id)
+// goodix.c:496
+static irqreturn_t goodix_ts_irq_handler(int irq, void *dev_id)
 {
-    struct ft6x36_data *data = dev_id;
-    struct i2c_client *client = data->client;
-    u8 buf[6];
-    int ret;
+    struct goodix_ts_data *ts = dev_id;
 
-    /*
-     * ★ i2c_transfer 可能 sleep！
-     * I2C 控制器需要等待从设备 ACK，期间 CPU 可以调度做别的事。
-     * 如果在硬中断上下文中调用 i2c_transfer，会触发 kernel BUG。
-     */
-    ret = i2c_master_recv(client, buf, sizeof(buf));
-    if (ret < 0) {
-        dev_err(&client->dev, "read touch data failed: %d\n", ret);
-        return IRQ_NONE;
-    }
+    // ★ 通过 I2C 读取触摸数据——必须 sleep
+    goodix_process_events(ts);
 
-    // 解析触摸坐标
-    int x = ((buf[0] & 0x0F) << 8) | buf[1];
-    int y = ((buf[2] & 0x0F) << 8) | buf[3];
-
-    // 上报到 input 子系统
-    input_report_abs(data->input, ABS_X, x);
-    input_report_abs(data->input, ABS_Y, y);
-    input_sync(data->input);
+    // ★ 写命令清除触摸控制器的中断状态
+    if (goodix_i2c_write_u8(ts->client, GOODIX_READ_COOR_ADDR, 0) < 0)
+        dev_dbg(&ts->client->dev, "I2C write end_cmd error\n");
 
     return IRQ_HANDLED;
 }
 ```
 
+`goodix_process_events` 内部通过 `i2c_transfer` 读取触摸坐标数据，然后解析并上报到 input 子系统。
+
 **为什么 i2c_transfer 需要 sleep？**
 
-I2C 协议是同步串行协议：主机发送地址后，从设备需要在每个字节后发送 ACK 信号。如果使用 `spin_lock_irqsave` 忙等，CPU 会在等待期间空转。对于低速 I2C（标准模式 100kHz，一个字节需 80μs），不可接受。
+I2C 协议是同步串行协议：主机发送地址后，从设备需要在每个字节后发送 ACK 信号。如果使用 `spin_lock_irqsave` 忙等，CPU 会在等待期间空转。对于标准模式 100kHz I2C，一个字节需 80μs，不可接受。
 
-内核的 I2C 核心层在 `i2c_transfer` 内部使用 `wait_for_completion` 等待 DMA 或中断完成——这必然导致调用进程进入睡眠等待状态。
+内核 I2C 核心在 `i2c_transfer` 内部使用 `wait_for_completion` 等待传输完成——这必然导致调用进程进入睡眠等待状态。
 
 在 IRQ context 中调用 `i2c_transfer` 会触发：
 
 ```
-BUG: sleeping function called from invalid context at kernel/i2c/i2c-core-base.c:...
+BUG: sleeping function called from invalid context at drivers/i2c/i2c-core-base.c:...
 in_atomic(): 1, irqs_disabled(): 1, ...
 ```
 
-这就是线程化 IRQ 存在的意义。
+这就是 Goodix 驱动选择纯线程化 IRQ（handler = NULL）的根本原因——必须 sleep。
 
 #### 5.16.4 irq_finalize_oneshot——处理完成后的收尾
 
@@ -1399,24 +1507,23 @@ static void irq_finalize_oneshot(struct irq_desc *desc, struct irqaction *action
 处理完成后，`irq_thread` 回到 `while (!irq_wait_for_interrupt(action))` 循环的顶部——再次检查 `IRQTF_RUNTHREAD` 标志。如果线程处理期间没有新中断发生（`IRQTF_RUNTHREAD` 没有被再次置位），线程回到睡眠状态，等待下一次 `__irq_wake_thread`。
 
 ---
-
 ### 5.17 第二幕路径全景总结
 
 ```
 触摸屏点击
   │
   ├─ 硬件层（同第一幕 §5.3）
-  │    INT 引脚电平变化 → EXTI/GIC → CPU
+  │    GPIOB2 → EXTI event N → GIC SPI M
   │
-  ├─ ARM64 入口（同第一幕 §5.4） + GIC 主循环（同第一幕 §5.5）
+  ├─ ARM64 入口（同第一幕 §5.4）+ GIC 主循环（同第一幕 §5.5）
   │
-  ├─ 流控：handle_fasteoi_irq                           §5.6
+  ├─ 流控：handle_fasteoi_irq                             §5.6
   │    IRQS_ONESHOT=true → mask_irq → handle_irq_event
   │    → cond_unmask_eoi_irq: 只 EOI，不 unmask
   │
-  ├─ 顶半部：ft6x36_irq_handler                          §5.13
-  │    读状态寄存器确认中断来源
-  │    return IRQ_WAKE_THREAD
+  ├─ 顶半部：irq_default_primary_handler                  §5.13
+  │    （内核内部默认 handler，handler=NULL 时自动设置）
+  │    return IRQ_WAKE_THREAD（什么都不做，直接唤醒线程）
   │
   ├─ __irq_wake_thread                                   §5.14
   │    set_bit(IRQTF_RUNTHREAD)
@@ -1426,15 +1533,16 @@ static void irq_finalize_oneshot(struct irq_desc *desc, struct irqaction *action
   ├─ 中断退出：irq_exit_rcu（同第一幕 §5.8）
   │
   ├─ 【分叉点】调度器决策                                §5.16
-  │    irq/N-ft6x36 被调度（SCHED_FIFO 优先级）
+  │    irq/269-goodix 被调度（SCHED_FIFO 优先级）
   │
   ├─ irq_thread 主循环                                   §5.16
   │    irq_wait_for_interrupt → 检查 IRQTF_RUNTHREAD
   │    → irq_thread_fn → action->thread_fn()
   │
-  ├─ thread_fn：ft6x36_irq_thread_fn                     §5.16
-  │    i2c_master_recv（sleep 等待 I2C 传输）
+  ├─ thread_fn：goodix_ts_irq_handler                     §5.16
+  │    goodix_process_events（I2C 传输——必须 sleep）
   │    → 解析坐标 → input_report_abs → input_sync
+  │    → goodix_i2c_write_u8（清中断状态）
   │
   ├─ irq_finalize_oneshot                                §5.16
   │    threads_oneshot &= ~action->thread_mask
@@ -1454,19 +1562,20 @@ static void irq_finalize_oneshot(struct irq_desc *desc, struct irqaction *action
 
 | 阶段 | 第一幕（gpio-keys KEY0） | 第二幕（I2C 触摸屏） |
 |------|------------------------|--------------------|
-| **DTS 路径** | GPIO PH5 → EXTI → GIC | 触摸 INT → EXTI(或直连) → GIC |
+| **DTS 路径** | GPIO PH5 → EXTI → GIC | GPIOB2 → EXTI → GIC |
 | **硬件触发** | 按键机械电平 → EXTI FPR 置位 | 电容感应电平 → EXTI RPR/FPR 置位 |
 | **GIC 处理** | gic_handle_irq 循环读 GICC_IAR → ID=273 | 同上，ID 不同 |
 | **流控函数** | handle_fasteoi_irq | handle_fasteoi_irq |
 | **IRQS_ONESHOT** | 否 | **是**（线程化 IRQ 标志） |
 | **mask_irq 时机** | 不由 handle_fasteoi 触发 | 由 handle_fasteoi 在 event 前触发 |
 | **EOI 时机** | event 后立即 EOI | event 后 EOI，但 mask 保留 |
-| **handler** | `gpio_keys_gpio_isr` | `ft6x36_irq_handler` |
+| **handler 来源** | 驱动注册：`gpio_keys_gpio_isr` | **内核默认**：`irq_default_primary_handler`（handler=NULL） |
 | **handler 返回值** | `IRQ_HANDLED` | **`IRQ_WAKE_THREAD`** |
+| **是否有驱动顶半部** | **是**（调度 work 即返回） | **否**（全在 irq_thread 中） |
 | **下半部触发** | `mod_delayed_work`（定时 10ms） | `__irq_wake_thread`（立即唤醒） |
-| **下半部机制** | system_wq 共享 worker | 专用 `irq/N-ft6x36` 内核线程 |
+| **下半部机制** | system_wq 共享 worker | 专用 `irq/269-goodix` 内核线程 |
 | **调度优先级** | CFS（普通公平调度） | SCHED_FIFO（实时优先级） |
-| **下半部执行** | 进程上下文，可调用 `gpiod_get_value_cansleep` | 进程上下文，可调用 `i2c_transfer` |
+| **下半部执行** | 进程上下文，`gpiod_get_value_cansleep` | 进程上下文，`i2c_transfer`（必须 sleep） |
 | **中断恢复** | cond_unmask_eoi_irq 直接 unmask+EOI | irq_finalize_oneshot 延迟 unmask |
 | **用户态** | evtest → EV_KEY / KEY_0 | evtest → EV_ABS / ABS_X / ABS_Y |
 
@@ -1534,24 +1643,29 @@ void note_interrupt(struct irq_desc *desc, irqreturn_t action_ret)
 Disabling IRQ #268
 ```
 
-#### 5.19.2 在 KEY0 场景中的虚假中断
+#### 5.19.2 虚假中断检测的条件回顾
 
-GPIO 按键因为机械弹片的物理特性，**按下和释放在短时间内可能产生多次边沿跳变**（反弹/bounce）。虽然 gpio-keys 驱动内部做了 10ms 的 software debounce，但对 EXTI 控制器来说，每次跳变都会触发一次中断。
+`note_interrupt` 根据 `__handle_irq_event_percpu` 的返回值判断：
 
-如果 debounce 不当，可能出现以下情况：
+- **`action_ret == IRQ_NONE`**：未处理计数器 `irqs_unhandled++`（所有 action 都返回 IRQ_NONE）
+- **`action_ret == IRQ_HANDLED`**：未处理计数器 `irqs_unhandled--`（至少有一个 action 返回 IRQ_HANDLED）
+- 当 `irqs_unhandled > THRESHOLD`：打印"Disabling IRQ #N"，mask 中断
 
-1. PH5 电平从高→低（按键按下）→ EXTI FPR 置位 → 中断触发
-2. handler 执行，`mod_delayed_work`，返回 IRQ_HANDLED
-3. 10ms 内 PH5 反弹回高又到低（机械弹片振动）→ 再次中断
-4. handler 再次执行，但此时 bdata->work 已经被前一次调度，`mod_delayed_work` 只是**重新设置定时器**，不会导致多次上报
+**所以虚假中断的核心条件是：handler 返回 IRQ_NONE**。返回 IRQ_HANDLED 的中断，不管频率多高，都不会触发虚假检测。
 
-但如果 PH5 的硬件设计有问题——如产生了频繁的噪声跳变——EXTI 检测到的边沿频率可能超过 handler 的处理能力。每次 handler 返回 IRQ_HANDLED，但 EXTI 的 pending 位已经被清掉后又立即被置位——`note_interrupt` 不会认为这是虚假中断（因为它确实被处理了），但 CPU 时间被大量浪费。
+#### 5.19.3 在 KEY0 场景中——不会触发
 
-#### 5.19.3 在触摸屏场景中的虚假中断
+KEY0 的 `gpio_keys_gpio_isr` 总是返回 `IRQ_HANDLED`。机械弹片的多次跳变虽然会产生多次中断，但每次 handler 都返回 IRQ_HANDLED——`note_interrupt` 只会递减未处理计数器，不会触发虚假禁用。
 
-触摸屏的 INT 引脚通常是**电平触发**（而非边沿触发）。如果触摸屏在初始化阶段尚未完成 I2C 通信配置，INT 引脚可能处于不确定状态，导致中断触发后顶半部读状态寄存器返回"无中断"——返回 IRQ_NONE。
+如果 KEY0 的 GPIO 引脚出现了因硬件故障导致的持续高频噪声，EXTI 会反复触发中断，每次 handler 跑完、EOI、下一秒又触发。CPU 时间确实会被浪费，但这是性能问题，不是虚假中断——`note_interrupt` 不会介入。解决方法是在硬件层面加滤波器或在 DTS 中增大 debounce。
 
-连续多次 IRQ_NONE 后，`note_interrupt` 会禁用该中断。这就是为什么触摸屏驱动在 probe() 中需要先完成 I2C 初始化、再 request_irq 的原因。
+#### 5.19.4 在触摸屏场景中——也不会触发
+
+Goodix 驱动使用了 `handler = NULL`，内核自动填入 `irq_default_primary_handler`，它永远返回 `IRQ_WAKE_THREAD`。`__handle_irq_event_percpu` 看到 IRQ_WAKE_THREAD，将其归类为已处理——`action_ret` 不会是 IRQ_NONE。所以 `note_interrupt` 也不会触发虚假检测。
+
+那么触摸屏的虚假中断确实不会发生吗？如果 GT9271 的 INT 引脚因 I2C 通信失败而持续拉低，EXTI 会反复检测到边沿。但只要 handler 被调用并返回 IRQ_WAKE_THREAD，`note_interrupt` 不会禁用中断。死循环表现为"不断唤醒 irq_thread"而不是"禁用中断"——这同样是个性能问题。
+
+**真正的虚假中断场景**通常出现在共享中断（`IRQF_SHARED`）中：一个中断触发后遍历 action 链表，所有 driver 的 handler 都返回 IRQ_NONE（不是我的设备）。这种情况在 STM32MP257 的 KEY0 和触摸屏上都不适用——它们都是独占中断。
 
 ---
 
@@ -1559,52 +1673,80 @@ GPIO 按键因为机械弹片的物理特性，**按下和释放在短时间内�
 
 #### 5.20.1 默认 affinity
 
-在 STM32MP257（双核 Cortex-A35）上，所有中断默认的 SMP affinity 是 **CPU0 和 CPU1**（`cpu_possible_mask` 的所有位）。这意味着 GIC Distributor 可以将中断分发给任意核心。
-
-查看当前分配：
+在 STM32MP257（双核 Cortex-A35）上，查看 KEY0 中断的当前亲和性：
 
 ```
 ~# cat /proc/irq/268/smp_affinity
 ff
 ```
 
-`0xff` (bit 0 + bit 1) 表示 CPU0 和 CPU1 都允许接收此中断。
+`0xff` 表示 CPU0（bit 0）和 CPU1（bit 1）都**在允许列表中**。但 GIC-400 的驱动实现**不会同时发给两个 CPU**——往下看。
 
-#### 5.20.2 GIC 的硬件分发
+#### 5.20.2 GIC-400 的实际分发机制
 
-GIC-400 通过 **GICD_ITARGETSR** 寄存器配置每个 SPI 的目标 CPU。每个 SPI 对应一个 `GICD_ITARGETSR` 寄存器（4 个字节，每个 CPU 占一个字节）：
+GIC-400 通过 **GICD_ITARGETSR** 寄存器配置每个 SPI 的目标 CPU。每个 SPI 占用一个字节，每个 bit 代表一个 CPU Interface。
 
-```
-SPI 273 对应的 GICD_ITARGETSR 偏移 = 0x1800 + (273 - 32) * 4 = 0x1C24
-```
-
-`gic_set_affinity` 在 `irq-gic.c` 中通过写这个寄存器实现：
+但 Linux 的 GIC-400 驱动在写这个寄存器时，**从允许列表里选一个 CPU**：
 
 ```c
-// irq-gic.c — gic_set_affinity（简化）
-static int gic_set_affinity(struct irq_data *d, const struct cpumask *mask_val, ...)
+// irq-gic.c:804 — gic_set_affinity
+static int gic_set_affinity(struct irq_data *d, const struct cpumask *mask_val, bool force)
 {
-    // 将 cpumask 转换为 GICD_ITARGETSR 的字节值
-    unsigned int cpu = cpumask_any_and(mask_val, cpu_online_mask);
-    u32 val = cpu << (cpu * 8);  // 每个 CPU 对应一个字节
+    // 步骤①：从允许的 mask 中选一个 CPU
+    cpu = cpumask_any_and(mask_val, cpu_online_mask);
 
-    // 写 GICD_ITARGETSR
-    writel_relaxed(val, base + GIC_DIST_ITARGETSR + offset);
-    ...
+    // 步骤②：只写这个 CPU 对应的 bit 到 GICD_ITARGETSR
+    writeb_relaxed(gic_cpu_map[cpu], reg);
+
+    // gic_cpu_map[0] = 0x01 (CPU0)、gic_cpu_map[1] = 0x02 (CPU1)
+
+    // 步骤③：记录 actual affinity——只有这一个 CPU
+    irq_data_update_effective_affinity(d, cpumask_of(cpu));
+    return IRQ_SET_MASK_OK_DONE;
 }
 ```
 
-#### 5.20.3 在场景中的实际表现
+这和 `smp_affinity` 的语义不同：
 
-对于 gpio-keys 的 KEY0 中断（SPI 273），如果两个 CPU 都在空闲状态，GIC 会将中断分发给**先 IAR 读的那个 CPU**——通常是先读到 GICC_IAR 的。这是一种自然的"负载均衡"，不需要软件干预。
+| `smp_affinity` | `effective_affinity`（实际分配） |
+|---------------|--------------------------------|
+| `ff`（CPU0+CPU1 都允许） | **只有一个 CPU**（由 `cpumask_any_and` 选中的） |
+| 软件层面：可以迁移到这些 CPU | 硬件层面：GICD_ITARGETSR 只填了一个 bit |
 
-但对于需要频繁 I2C 传输的触摸屏，如果中断在两个 CPU 间频繁迁移，可能导致 cache 亲和性下降（irq 线程的数据在 CPU0 的 cache 中，但被分发到 CPU1）。典型优化是将触摸屏中断绑定到指定 CPU：
+也就是说，**GIC-400 在任一时刻把每个 SPI 发给唯一一个 CPU**。`smp_affinity` 里的多 CPU 位不是让硬件做负载均衡，而是告诉内核"这个中断可以在这几个 CPU 间迁移"——迁移过程由软件触发（写 `smp_affinity`、`irqbalance` 后台服务、或者 `setup_affinity` 在 request_irq 时的初始分配）。
 
-```shell
-echo 1 > /proc/irq/269/smp_affinity    # 只让 CPU0 处理
+#### 5.20.3 `setup_affinity` 的分配策略
+
+中断注册时（`request_irq`），内核调用 `irq_setup_affinity()`（`manage.c:594`）做初始分配：
+
+```c
+set = irq_default_affinity;          // 默认 = 所有 online CPU
+cpumask_and(&mask, cpu_online_mask, set);
+...
+irq_do_set_affinity(&desc->irq_data, &mask, false);
+    → gic_set_affinity()            // 从 mask 中选一个 CPU
 ```
 
-`/proc/irq/N/smp_affinity` 的写入会触发 `gic_set_affinity`，更新 GICD_ITARGETSR 寄存器。之后所有 SPI 273 的中断只发送给 CPU0。
+默认的 `irq_default_affinity` 是所有 online CPU。但 `gic_set_affinity` 只从里面挑一个。如果系统上有多个中断，它们会被分配到不同的 CPU 上——这是内核层面的一种**软件负载均衡**，不是硬件做的。
+
+#### 5.20.4 场景中的实际表现
+
+假设系统启动后 KEY0 分到了 CPU0，触摸屏分到了 CPU1。查看 `effective_affinity`：
+
+```
+~# cat /proc/irq/268/effective_affinity
+0
+~# cat /proc/irq/269/effective_affinity
+1
+```
+
+每个中断固定在一个 CPU 上，不会在两次中断间自动切换。如果想手动固定：
+
+```shell
+echo 1 > /proc/irq/269/smp_affinity    # 只允许 CPU0
+```
+
+这会触发 `gic_set_affinity`，将触摸屏中断从 CPU1 迁移到 CPU0，更新 GICD_ITARGETSR 寄存器。
 
 ---
 
