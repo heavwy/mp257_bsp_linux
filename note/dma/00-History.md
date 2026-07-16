@@ -417,6 +417,13 @@ quadrantChart
 
 **总结：** 从 ISA 到 PCI，有两个独立的演进方向——**架构上**从中央走向分布式（DMA 控制权下放到外设）；**编程模型上**从寄存器走向描述符（任务描述从 I/O 端口搬到内存）。HPDMA 是这两个演进方向的交叉产物：架构继承 ISA（中央 DMAC），编程模型继承 PCI（描述符）。
 
+以上讨论的 ISA 和 PCI 都来自 PC 体系。2000 年代嵌入式 SoC 兴起后，DMA 控制器的演进走了另一条路——它同时继承了 ISA 和 PCI 的不同侧面：
+
+- **架构上回退到中央 DMAC 模式**：SoC 中的外设（SPI、UART、I2C、音频）不像 PCI 设备那样每个都集成 DMA 能力——那样芯片面积太大。它们复用一组中央 DMA 控制器，由请求线（或 MUX）连接。这点更像 ISA 8237。
+- **编程模型上继承 PCI 的描述符方式**：中央 DMAC 接受的是内存中的描述符链表（而不是逐寄存器编程），因为描述符能表达更复杂的传输序列，且 CPU 只需要排好链表就能启动一批传输。这点继承自 PCI Bus Mastering 的"CPU 配描述符 → 硬件自行取用"模式。
+
+SoC 的 DMA 实际上是对前两个阶段的**混合与取舍**。下面分两个趋势来看。
+
 ### 1.4 硬件阶段三：嵌入式 SoC 内部的 DMA（2000s~至今）
 
 ARM 在 2000 年代进入 SoC 市场后，DMA 控制器的设计呈现两个趋势：
@@ -443,6 +450,8 @@ ARM 在 2000 年代进入 SoC 市场后，DMA 控制器的设计呈现两个趋�
 
 这些硬件演化**直接塑造了 Linux DMA 子系统的软件架构**——我们在后面的章节中会逐一看到，每个关键数据结构的设计背后都有对应的硬件问题。
 
+以上讨论的都是 DMA "能不能搬"和"怎么搬"的问题。但还有另一个更基础的问题，贯穿 ISA/PCI/SoC 所有阶段，跟具体的总线拓扑或描述符模式无关——**CPU 和 DMA 共享同一片内存，但它们的访问路径不同，看到的数据可能不一致。** 这是 DMA 子系统的核心矛盾，也是 Linux 为此建立了一整套 API（dma-mapping）的根本原因。
+
 ### 1.5 DMA 的核心矛盾：CPU 和 DMA 共享内存时谁说了算
 
 DMA 的本质问题是**共享内存的并发访问**。CPU 和 DMA 控制器从两个不同的路径访问同一片物理内存。在没有复杂 cache 一致性的年代（386/486），这还不是大问题——CPU 直接读写内存芯片，DMA 也直接读写内存芯片，双方看到的是同一个物理存储。但现代 CPU 在 CPU 和内存之间加了多级 cache（L1/L2/L3），而 DMA 控制器通常不经过 cache。于是出现了一个经典的不一致问题：
@@ -462,72 +471,141 @@ DMA 的本质问题是**共享内存的并发访问**。CPU 和 DMA 控制器从
 
 多数嵌入式 SoC（包括 STM32MP257）走的是路径 B——AXI 总线没有一致性协议支持，DMA 和 CPU 看到的数据可能不一致，需要软件干预。这是 dma-mapping API 区分 coherent mapping 和 streaming mapping 的根本原因。
 
-### 1.6 三种地址：CPU 看到的、内存实际在哪的、DMA 设备能访问的
+简单区分两者：
 
-在深入早期 DMA API 之前，必须先搞清楚一个基本概念：一次 DMA 传输中涉及**三个完全不同的地址空间**。
+- **Coherent mapping**（`dma_alloc_coherent`）：分配一块内存，保证 CPU 和 DMA 看到的内容始终一致。在路径 B 的 SoC 上，内核通过页表属性将这片内存设置为**非 cacheable**（或 且配置特定的 cache 策略），CPU 每次读写都直接访问物理内存，不走 cache。代价是访问速度慢（因为绕过了 cache），但避免了同步开销。
 
-以 STM32MP257 为例：CPU 执行指令 `mov r0, [0xffffff8000100040]` 时，这个 `0xffffff8000100040` 是 CPU 通过 MMU（内存管理单元）看到的一个**虚拟地址**。MMU 查页表发现这个虚拟地址对应物理地址 `0x100040`，于是在物理内存的第 `0x100040` 字节处读写数据。
+- **Streaming mapping**（`dma_map_single` / `dma_map_sg`）：使用普通的 cacheable 内存，在 DMA 传输前后由软件显式同步（`dma_sync_single_for_device` / `dma_sync_single_for_cpu`）。传输前将 cache 数据写回内存（CPU 修改过的数据不会丢），传输后将对应 cache line 失效（下次 CPU 读时从内存重新加载）。这样既享受 cache 的性能，又在关键节点保证数据一致。
 
-与此并行的是，SPI 控制器配置好 HPDMA 寄存器后，HPDMA 引擎直接连在 AXI 总线上。它不经过 MMU，它看到的是**AXI 总线地址空间**——在这个 SoC 上，`0x100040` 这个地址同样能访问到物理内存的第 `0x100040` 字节（直接映射）。但对某些 DMA 控制器来说，它只能访问 `0xc0000000~0xffffffff` 这个范围的地址。
+下面列举一些常见 SoC 所属的路径（以主流主线内核配置为准）：
+
+| SoC | CPU 核心 | 互连 | DMA 路径 | 原因 |
+|-----|----------|------|---------|------|
+| **i.MX6ULL** | Cortex-A7 | AXI | **B** | 无 CCI/ACP，DMA 直连 AXI 到 DDR |
+| **STM32MP157** | Cortex-A7 | AXI | **B** | 同 i.MX6ULL，无硬件一致性支持 |
+| **STM32MP257** | Cortex-A35 | AXI | **B** | HPDMA 走 AXI 主端口，不经过一致性互连 |
+| **RK3568** | Cortex-A55 | AXI | **B** | Rockchip DMAC 通过 AXI 直接访存，无 I/O coherency |
+| **RK3399** | A72 + A53 | CCI-400 | **B** | CCI 只连接 CPU 集群和 GPU，DMA 绕过 CCI 走 DMC |
+| **RK3588** | A76 + A55 | DSU + 自定义 | **B** | DMA 走 AXI 主互连，不经过 DSU；NPU/GPU 部分有硬件 coherency 但通用 DMAC 没有 |
+| **Zynq7020 PS** | Cortex-A9 | AXI + SCU（ACP） | **B**（典型） | PL330 DMAC 走 AXI 到 DDR，不走 ACP。PL 侧可通过 ACP 实现路径 A，但 PS 内置 DMA 是路径 B |
+| **骁龙 845** | A75 + A55 | Qualcomm Data Fabric + SMMU | **A** | 系统缓存（LLCC）和 SMMU 支持 I/O coherency，DMA 传输可以硬件保证一致性 |
+
+几点说明：
+
+- **路径 A 需要硬件支持，不止是互连有 ACE/CHI 接口，还要 DMA 主控和 SMMU 都正确配置。** 现代应用处理器（骁龙 8xx、Exynos、Tensor）基本都走路径 A，代价是额外的芯片面积和功耗。
+- **同一颗 SoC 里的不同 DMA 主控可能走不同路径。** 以 RK3588 为例：通用 DMAC 走路径 B，而 NPU 和 VPU 通过 IOMMU 可以实现路径 A。以 Zynq7020 为例：PS 侧 PL330 走路径 B，PL 侧自定义 DMA 如果接 ACP 可以走路径 A。
+- **路径 B 是嵌入式 SoC 的多数选择，也是 Linux dma-mapping API 设计的主要目标。** 路径 A 的 SoC 也兼容路径 B——`dma_alloc_coherent` 在路径 A 的 SoC 上可能退化为一次普通的页分配，因为硬件自己保证一致性。
+
+### 1.6 三种地址：虚拟地址、物理地址、DMA 地址
+
+驱动写 DMA 传输时，一个最常见的困惑是：**dma_alloc_coherent 返回了两个地址，为什么要两个？分别给谁用？**
+
+原因是 CPU 和 DMA 控制器看内存的"视角"不同，一次 DMA 传输中涉及三个地址：
+
+| 地址 | 谁在用 | 说明 |
+|------|--------|------|
+| **虚拟地址（VA）** | CPU（MMU 开启后） | CPU 指令中用的地址，经 MMU 翻译 |
+| **物理地址（PA）** | 内存控制器 | 内存芯片上的真实位置 |
+| **DMA 地址（DMA addr）** | DMA 控制器 | 设备在总线上看到的地址。有 SMMU 时 ≠ PA，无 SMMU 时 = PA |
+
+举一个具体例子。STM32MP257 上，SPI 驱动通过 DMA 从 SPI FIFO 搬 256 字节到内存 buffer，典型代码：
+
+```c
+// 步骤 1：分配一块 DMA buffer
+dma_addr_t dma_handle;
+void *cpu_addr;
+
+cpu_addr = dma_alloc_coherent(dev, 256, &dma_handle, GFP_KERNEL);
+// 返回两个值：
+//   cpu_addr   = 0xffffff8000100040  → CPU 用这个地址读写 buffer（虚拟地址）
+//   dma_handle = 0x0000000000100040  → DMA 控制器用这个地址访问 buffer（DMA 地址）
+
+// 步骤 2：排描述符，告诉 HPDMA 从 SPI FIFO 搬到 dma_handle
+struct stm32_dma3_lli lli = {
+    .csar = 0x44020000 + 0x0C,  // SPI FIFO（外设地址，不是内存，不需要 DMA 地址翻译）
+    .cdar = dma_handle,         // ← 这里！写的是 dma_handle，不是 cpu_addr
+    .cbr1 = 256,
+    .cllr = NULL,
+};
+
+// 步骤 3：启动 DMA
+// CPU 读写 buffer 时用 cpu_addr：
+spi_data = readl(cpu_addr + offset);   // 用虚拟地址
+// DMA 控制器读写 buffer 时用 dma_handle（装在描述符的 CDAR 里）：
+//   HPDMA 在 AXI 总线上发事务：地址 = 0x100040
+//   → 直连 AXI，无 SMMU，DMA 地址 = 物理地址
+//   → 内存控制器响应，读写物理地址 0x100040
+```
+
+**为什么不能只用其中一个？**
+
+- 如果驱动把 `cpu_addr`（0xffffff8000100040）写进 HPDMA 的 CDAR 寄存器——HPDMA 在 AXI 总线上发地址 0xffffff8000100040，这个地址超出 DDR 范围，**内存控制器不会响应**，传输失败。
+- 如果驱动用 `dma_handle`（0x100040）作为指针读写数据——CPU 的 MMU 开启后，0x100040 这个虚拟地址可能没有映射到页表，**直接访存会触发异常**。
+
+所以 `dma_alloc_coherent` 必须返回两个值：一个给 CPU 用来访问（虚拟地址），一个给 DMA 控制器用来访问（DMA 地址）。**两个地址指向同一块物理内存，但各自从不同的路径到达那里。**
 
 ```
-CPU 视角（虚拟地址）            MMU 页表             物理地址/DMA 地址（STM32MP257 HPDMA 直接映射）
-┌───────────────────┐         ┌──────────┐         ┌────────────────────┐
-│ 0xffffff8000100040│ ──────→ │ 翻译    │ ──────→ │ 0x0000000000100040 │
-│ (MMU 虚拟地址)    │         └──────────┘         │ (物理内存位置)      │
-│                   │                              │                    │
-│                   │                          DMA 控制器(STM32 HPDMA) │
-│                   │                              │ 看到同样的地址空间   │
-└───────────────────┘                              └────────────────────┘
+CPU 路径：
+  cpu_addr (0xffffff8000100040, 虚拟地址)
+    → MMU 页表翻译
+    → 物理地址 0x100040
+    → 内存芯片
+
+DMA 路径：
+  dma_handle (0x0000000000100040, DMA 地址)
+    → AXI 总线事务（无 SMMU）
+    → 物理地址 0x100040
+    → 同一块内存芯片
 ```
 
-归纳为三个明确的术语：
+**有 SMMU 时呢？**
 
-| 术语 | 英文 | 谁在用 | 含义 |
-|------|------|--------|------|
-| **虚拟地址** | Virtual Address | CPU (MMU 使能后) | CPU 指令中使用的地址，经 MMU 页表转换为物理地址 |
-| **物理地址** | Physical Address | 内存控制器、MMU | 物理内存芯片上的真实位置 |
-| **总线/DMA 地址** | Bus/DMA Address | DMA 控制器、外设 | 设备在总线上看到的地址空间。有 IOMMU/SMMU 时与物理地址不同，无 IOMMU 时等于物理地址 |
+SMMU（System MMU，系统内存管理单元）是**给 DMA 控制器用的 MMU**，也叫 **IOMMU（I/O Memory Management Unit）**——两者是同一概念，ARM 生态叫 SMMU，x86 和通用 Linux 叫 IOMMU。作用完全一样：对 DMA 事务做地址翻译。
 
-这三个地址在嵌入式系统上的典型关系：
+没有 SMMU 时，DMA 控制器在总线上发的地址就是物理地址（直接到内存控制器）。有 SMMU 时，DMA 地址可以是一个"虚拟"的总线地址，SMMU 拦截 DMA 事务并翻译成物理地址：
 
 ```
-CPU (虚拟地址)                MMU                 Physical Memory
- 0xffffff8000100040 ──→ 页表:[VA→PA] ──→  0x100040 (物理地址)
-                                            ↑
-DMA 控制器 (HPDMA) ─────────────────────────┘
- 写 CDAR=0x100040                           ↑
-                                            |  (DMA 地址 = 物理地址,
-                                            |   因为 HPDMA 直连 AXI，
-                                            |   无 SMMU 做地址翻译)
+DMA 控制器发地址 0xc0000000
+  → AXI 总线上的 SMMU 拦截这个事务
+  → SMMU 查自己的页表：0xc0000000 → 物理地址 0x100040
+  → 内存控制器响应 0x100040
 ```
 
-关键结论：**DMA 设备不经过 MMU**。它直接访问物理地址空间。如果 SoC 有 SMMU（System MMU，如 ARM MMU-600），DMA 设备看到的总线地址可以被 SMMU 翻译成物理地址——这时 DMA 地址 ≠ 物理地址。STM32MP257 的 HPDMA 直连 AXI 总线，没有 SMMU，DMA 地址就等于物理地址。
+这个机制有什么用？
 
-这个区别直接贯穿整个 DMA API 的设计——`dma_alloc_coherent()` 返回两个值：`cpu_addr`（给 CPU 访问的虚拟地址）和 `dma_handle`（给 DMA 控制器编程的总线地址）。驱动必须同时使用这两个地址，缺一不可。
+- **安全隔离**：SMMU 页表限制每个 DMA 设备只能访问自己的物理内存区域。恶意或出错的设备不能越界读写。
+- **简化驱动**：驱动不需要知道物理内存的碎片分布。SMMU 把不连续的物理页映射为一段连续的 DMA 地址空间，驱动看到的就是一个大 buffer。
+- **用户态 DMA**：通过 SMMU 把用户态虚拟地址映射给 DMA 控制器，用户进程可以直接发起 DMA 传输。
 
-### 1.3 早期 DMA 接口的混乱
+STM32MP257 的 HPDMA 直连 AXI 主互连，中间没有 SMMU。所以 DMA 地址 = 物理地址。`dma_alloc_coherent` 返回的 `dma_handle` 就是物理地址本身。
 
-明确三种地址的区分后，再看早期 Linux 的 DMA 接口就知道问题出在哪了。
+**一句话总结：**
+- `cpu_addr` → **CPU 用**（虚拟地址，读写数据时用）
+- `dma_handle` → **DMA 控制器用**（写进描述符的地址字段，硬件搬运时用）
+- 两者指向**同一块物理内存**，但走不同的路径到达
+
+### 1.7 早期 DMA 接口的混乱（v2.4 及之前）
+
+有了前面对三种地址（VA / PA / DMA addr）的区分，再看早期 Linux 的 DMA 接口就知道问题在哪了：**当时的接口把 CPU 地址和 DMA 地址混为一谈，认为它们之间就是简单的加减偏移。**
 
 Linux v2.4 及之前，内核没有一个统一的 DMA API。DMA 相关操作分散在各架构的实现中。
 
 **`virt_to_bus()` 的问题**：
 
 ```c
-/* 早期 x86 上的 DMA：假设虚拟地址 - 偏移 = 总线地址 */
+/* 早期 x86 上的 DMA：假设虚拟地址 − 偏移 = 总线地址 */
 unsigned long virt_to_bus(volatile void *address);
 void *bus_to_virt(unsigned long address);
 ```
 
-这个函数在 x86 早期 PC 上确实能工作——因为在没有 IOMMU 的 x86 上，物理地址 = 总线地址，而线性映射区中虚拟地址 = 物理地址 + 固定偏移（PAGE_OFFSET）。所以 `virt_to_bus(vaddr)` = `vaddr - PAGE_OFFSET` = 物理地址 = 总线地址。
+这个函数在 x86 早期 PC 上确实能工作——因为没有 IOMMU 的 x86 上物理地址 = 总线地址，而线性映射区中虚拟地址 = 物理地址 + 固定偏移（PAGE_OFFSET）。所以 `virt_to_bus(vaddr)` = `vaddr − PAGE_OFFSET` = 物理地址 = 总线地址。
 
 但在 ARM 上，这个假设立刻失效：
 - MMU 开启后，CPU 看到的是虚拟地址，需要查页表才能得到物理地址
 - 并非所有虚拟地址都有线性映射关系（vmalloc、ioremap 的区域就是动态映射的）
 - DMA 设备可能只能访问特定范围的物理地址（比如某些 SoC 上只有低 32MB 是 DMA 可访问的）
 
-所以 ARM 早期实现不得不自己维护一套 DMA 地址转换：
+ARM 早期实现不得不自己维护一套 DMA 地址转换：
 
 ```c
 /* ARM 早期 DMA 地址转换 */
@@ -540,44 +618,19 @@ void *__dma_to_virt(struct device *dev, dma_addr_t addr);
 ```c
 #include <linux/pci.h>
 
-/* 一致性映射 */
 void *pci_alloc_consistent(struct pci_dev *pdev, size_t size,
                            dma_addr_t *dma_handle);
-
-/* 流式映射 */
 dma_addr_t pci_map_single(struct pci_dev *pdev, void *ptr,
                           size_t size, int direction);
-
-/* Cache 同步 */
 void pci_dma_sync_single(struct pci_dev *pdev, dma_addr_t dma_handle,
                          size_t size, int direction);
 ```
 
 对于没有 PCI 总线的嵌入式设备（ARM AMBA/AXI 总线、PowerPC 的 local bus），驱动开发者只能用架构特定的 DMA API 或直接操作寄存器。以 v2.4 中的 ARM 平台为例，DMA 操作通过 `arch/arm/mach-*/dma.c` 中的架构专用函数完成——每个 SoC 的实现都不同，驱动没有跨平台移植的可能。
 
-`virt_to_bus()` 最终被标记为 `__deprecated`，内核文档 `Documentation/DMA-API-HOWTO.txt` 直言：
+`virt_to_bus()` 最终被标记为 `__deprecated`，内核文档直言：
 
 > Drivers converted fully to this interface should not use virt_to_bus() any longer, nor should they use bus_to_virt().
-
-**PCI 专属的 DMA API**：Linux v2.4 中，DMA API 是通过 PCI 总线接口暴露的：
-
-```c
-#include <linux/pci.h>
-
-/* 一致性映射 — 分配并映射 DMA buffer */
-void *pci_alloc_consistent(struct pci_dev *pdev, size_t size,
-                           dma_addr_t *dma_handle);
-
-/* 流式映射 — 映射已有 buffer 给 DMA 使用 */
-dma_addr_t pci_map_single(struct pci_dev *pdev, void *ptr,
-                          size_t size, int direction);
-
-/* Cache 同步 */
-void pci_dma_sync_single(struct pci_dev *pdev, dma_addr_t dma_handle,
-                         size_t size, int direction);
-```
-
-这些函数只在 PCI 总线上可用。对于嵌入式设备（通常没有 PCI 总线，而是 AMBA/AXI 等 SoC 内部总线），驱动开发者要么使用架构特定的 DMA API，要么自己直接操作 DMA 控制器寄存器。以 v2.4 中的 ARM 平台为例，DMA 操作通常通过 `arch/arm/mach-*/dma.c` 中的架构专用函数完成——每个 SoC 的 DMA 驱动实现完全不同，没有跨 SoC 移植的可能。
 
 **没有标准 DMA 控制器的框架**：即使解决了 buffer 映射问题，驱动开发者还需要自己管理 DMA 硬件控制器的整个生命周期——分配通道、建立描述符、处理中断、管理完成队列。每个 DMA 控制器的驱动都在重复造轮子：sa11x0 有自己的描述符链表管理，pxa 有自己的 DMA 描述符池，davinci 有另一套实现。这些驱动之间没有共享任何代码。
 
