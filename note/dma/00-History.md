@@ -1171,7 +1171,7 @@ LLI[N-1]: period N-1 → I2S TX FIFO
 
 STM32MP257 的 HPDMA 中，每个 LLI（Linked List Item）包含一个 `CLLR` 字段指向下一段描述符。最后一个 LLI 的 `CLLR` 指向第一个，就形成了循环链表。DMA 控制器自动遍历这个环，永不停止，直到驱动程序调用 `device_terminate_all()`。
 
-每完成一个 period，DMA 控制器触发 HTF（Half Transfer Flag）中断。ISR 中调用 `vchan_cyclic_callback()`，它会将 `vc->cyclic` 指向当前完成的描述符，然后调度 tasklet。tasklet 执行时调用驱动注册的 period callback——通常是 ALSA 驱动更新下一个 period 的数据：
+每个 LLI 描述符可以在 `ctr1` 寄存器中设置中断使能位（CIE）。每完成一个 period（即一个 LLI），DMA 控制器触发该 LLI 的完成中断。ISR 中调用 `vchan_cyclic_callback()`，它会将 `vc->cyclic` 指向当前完成的描述符，然后调度 tasklet。tasklet 执行时调用驱动注册的 period callback——通常是 ALSA 驱动更新下一个 period 的数据：
 
 ```
 ALSA period_elapsed()
@@ -1206,63 +1206,75 @@ Camera DMA → 共享 buffer → 编码器 DMA
 
 2011 年 Linaro 内存管理峰会上，多家厂商（TI、三星、Intel）一致认为需要一个统一的内核级 buffer 共享机制。Sumit Semwal 在 2011 年 10 月提交了第一版 RFC，经过 4 轮 review（涉及 Dave Airlie、Daniel Vetter、Rob Clark、Arnd Bergmann 等多位维护者），最终在 v3.3 合入主线。
 
-dma-buf 的核心数据结构：
+先看一个实际的例子来理解 dma-buf 解决的问题。一个嵌入式设备的摄像头预览通路：
+
+```
+场景：摄像头采集一帧 → 显示在屏幕上
+
+设备：Camera（V4L2 驱动）      Display（DRM/KMS 驱动）
+DMA：CSI 接口 DMA              显示控制器 DMA
+
+无 dma-buf 时的做法（两次拷贝）：
+  Camera DMA → buffer A → CPU memcpy → buffer B → Display DMA
+  ↑ 占用 CPU 时间和总线带宽，浪费内存                          ↑
+
+有 dma-buf 时的做法（零拷贝）：
+  Camera DMA → 同一块 buffer → Display DMA
+  ↑ Camera DMA 写完，Display DMA 直接读，CPU 不碰数据        ↑
+```
+
+dma-buf 就是实现这种零拷贝共享的机制。它引入了两个角色：
+
+| 角色 | 谁扮演 | 做什么 |
+|------|--------|--------|
+| **导出者（exporter）** | 分配 buffer 的驱动（如 V4L2） | 分配物理内存，创建 dma-buf，把 fd 传给用户态 |
+| **导入者（importer）** | 使用 buffer 的驱动（如 DRM） | 从 fd 获取 dma-buf，映射到自己的 DMA 地址空间 |
+
+用上面的摄像头预览来看完整流程：
 
 ```c
-struct dma_buf {
-    size_t size;
-    struct file *file;                    /* → fd 的基础 */
-    struct list_head attachments;          /* 导入者列表 */
-    const struct dma_buf_ops *ops;
+/* ===== 导出侧：V4L2 摄像头驱动 ===== */
 
-    /* 导出者私有数据 */
-    void *priv;
+/* 1. 分配物理内存（CMA 中分配一帧 1920×1080 YUV 数据） */
+struct dma_buf *dmabuf;
+dmabuf = dma_buf_export(camera_priv, &camera_ops, 1920*1080*3/2, O_RDWR);
+/* camera_priv: 驱动自己的 buffer 管理结构体 */
+/* camera_ops: 实现 map_dma_buf / unmap_dma_buf / release 回调 */
 
-    /* 引用计数 */
-    struct kref refcount;
+/* 2. 获取 dmabuf fd 返回给用户态应用 */
+int fd = dma_buf_fd(dmabuf, O_CLOEXEC);
+/* 应用在 V4L2 的 VIDIOC_QBUF 中拿到这个 fd */
 
-    /* 动态更新的 DMA 地址映射 */
-    struct list_head reservations;
-};
+/* 3. 用户态应用把 fd 传给 DRM 显示驱动 */
+ioctl(drm_fd, DRM_IOCTL_MODE_ADDFB2, &fb_args);
+/* fb_args 中包含了 dmabuf fd，传给 DRM 驱动 */
 
-struct dma_buf_attachment {
-    struct dma_buf *dmabuf;
-    struct device *dev;                    /* 导入者设备 */
-    struct sg_table *sgt;                  /* 当前 DMA 映射 */
-    struct list_head node;
-};
 
-struct dma_buf_ops {
-    struct sg_table *(*map_dma_buf)(struct dma_buf_attachment *attach,
-                                     enum dma_data_direction dir);
-    void (*unmap_dma_buf)(struct dma_buf_attachment *attach,
-                          struct sg_table *sgt,
-                          enum dma_data_direction dir);
-    void (*release)(struct dma_buf *dmabuf);
-    /* mmap 等 */
-};
+/* ===== 导入侧：DRM 显示驱动 ===== */
+
+/* 4. DRM 驱动从 fd 获取 dma-buf 对象 */
+struct dma_buf *dmabuf = dma_buf_get(fd);
+
+/* 5. 关联自己的设备 */
+struct dma_buf_attachment *attach;
+attach = dma_buf_attach(dmabuf, drm_dev);
+
+/* 6. 映射到显示控制器的 DMA 地址空间 */
+struct sg_table *sgt;
+sgt = dma_buf_map_attachment(attach, DMA_TO_DEVICE);
+/* 返回 SG 表，显示控制器可以编程 DMA 从这些物理地址读数据 */
+
+/* 7. 编程显示控制器的 DMA 描述符 */
+display_dma_program(sgt->sgl, sgt->nents);
+
+/* 8. 显示完成后释放 */
+dma_buf_unmap_attachment(attach, sgt, DMA_TO_DEVICE);
+dma_buf_detach(dmabuf, attach);
+dma_buf_put(dmabuf);        /* 引用计数 -1 */
+close(fd);                  /* 引用计数再 -1，到 0 时 release 回调释放内存 */
 ```
 
-dma-buf 的完整生命周期：
-
-```
-分配侧（导出者，如 V4L2 驱动）:
-  1. 分配物理内存（CMA 或其它）
-  2. dma_buf_export(priv, ops, size, flags) → struct dma_buf *
-  3. dma_buf_fd(dmabuf, O_CLOEXEC) → fd  ← 返回给用户态
-  4. 用户态把 fd 传给另一个驱动
-  
-使用侧（导入者，如 DRM 驱动）:
-  5. dma_buf_get(fd) → struct dma_buf *   ← 获取引用
-  6. dma_buf_attach(dmabuf, dev) → struct dma_buf_attachment *
-  7. dma_buf_map_attachment(attach, dir) → struct sg_table *
-       → 此时导入者拿到 SG 表，可以编程 DMA 引擎传输
-  8. DMA 传输...
-  9. dma_buf_unmap_attachment(attach, sgt, dir)
-  10. dma_buf_detach(dmabuf, attach)
-  11. dma_buf_put(dmabuf)
-  12. close(fd)
-```
+结果：摄像头 DMA 和显示控制器 DMA 读写同一块物理内存，**CPU 没有拷贝过一个字节**。
 
 dma-buf 的核心设计决策是**基于 fd 的共享模型**。选择 fd 而非其他 IPC 机制的原因：
 
@@ -1349,26 +1361,66 @@ STM32MP257 上可用的 dma-heap 类型：
 
 随着 SoC 上外设数量增多，一个矛盾出现了：DMA 控制器通道数量有限（STM32MP257 的 HPDMA 每个实例只有 16 个通道），而需要 DMA 的外设可能有几十个（UART×8、SPI×6、I2C×6、SDMMC×2、SAI×4...）。不是所有外设同时需要 DMA，所以 SoC 设计者在 DMA 控制器和外设之间增加了一层**请求路由器**——DMAMUX。
 
-```
-外设请求:
-USART1_RX ─┐
-USART1_TX ─┤
-SPI2_RX   ─┤
-SPI2_TX   ─┤   ┌──────────┐    ┌──────────────┐
-  ...      ─┤   │ DMAMUX   │    │ HPDMA 通道 0  │
-SAI1_A    ─┤──→│ (请求号   │───→│ HPDMA 通道 1  │
-SAI1_B    ─┤   │  路由)    │    │  ...          │
-  ...      ─┤   └──────────┘    └──────────────┘
-             └──→ DMA 请求 0~254
+```mermaid
+flowchart LR
+    subgraph 外设请求
+        USART1_RX
+        USART1_TX
+        SPI2_RX
+        SPI2_TX
+        SAI1_A
+        SAI1_B
+    end
+
+    subgraph DMAMUX
+        direction LR
+        MUX[DMAMUX\n请求号路由]
+    end
+
+    subgraph HPDMA通道
+        CH0[HPDMA 通道 0]
+        CH1[HPDMA 通道 1]
+        CHN[...]
+    end
+
+    USART1_RX & USART1_TX & SPI2_RX & SPI2_TX & SAI1_A & SAI1_B --> MUX
+    MUX --> CH0 & CH1 & CHN
 ```
 
 DMAMUX 的本质是一个多路选择器：每个 HPDMA 通道对应一个 DMAMUX 通道，每个 DMAMUX 通道可以通过写寄存器选择从哪个外设接收 DMA 请求。
 
 ### 6.2 dma_router 框架
 
+先看一个问题场景。STM32MP257 有 3 个 HPDMA 实例，每个 16 通道，共 48 通道。但需要 DMA 的外设有 50+（USART×8、SPI×6、I2C×6、SDMMC×2、SAI×4……）。不是所有外设同时工作，SoC 设计者用 DMAMUX 解决这个矛盾——48 个 HPDMA 通道通过 DMAMUX 映射到 250+ 个外设请求号，哪个外设要用 DMA，就临时把它的请求号路由到一个空闲通道上。
+
 在引入 DMA Router 框架之前，每个需要 DMAMUX 的 SoC 都要在 DMA 控制器驱动内部实现路由逻辑。TI 的 crossbar、STM32 的 DMAMUX、i.MX 的 DMA mux 都是类似硬件，但它们的驱动是各自实现的。
 
-dma_router 框架标准化了路由操作：
+用一个实际的上电流程来看 dma_router 的作用。假设系统启动后，USART1 驱动 probe，请求 DMA TX 通道：
+
+```
+USART1 probe → 需要 DMA TX
+  │
+  ├── ① DTS 告诉驱动："你的 TX 请求号是 2，走 hpdma"
+  │
+  ├── ② dma_router.route_alloc() 被调用，传入请求号 2
+  │     │
+  │     ├── DMAMUX 驱动找到一个空闲的 DMAMUX 通道（比如通道 3）
+  │     ├── 写 DMAMUX_CCR(3) = 2    ← 将请求号 2 路由到 DMAMUX 通道 3
+  │     └── 调用 dma_request_channel() 获取 HPDMA 通道
+  │           │
+  │           └── 拿到 HPDMA 通道 5（HPDMA 通道 5 绑定到 DMAMUX 通道 3）
+  │
+  ├── ③ USART1 拿到 struct dma_chan *（指向 HPDMA 通道 5）
+  │
+  └── ④ 之后 USART1 每次发起 DMA 传输：
+         TX FIFO 有数据 → 拉请求号 2
+         → DMAMUX 通道 3 收到 → 转发给 HPDMA 通道 5
+         → HPDMA 执行搬运
+```
+
+此时如果 USART2 也申请 DMA TX，DMAMUX 会分配另一个空闲通道（比如通道 4），路由到另一个 HPDMA 通道（比如通道 6）。两者互不干扰。
+
+dma_router 框架标准化了路由操作，核心接口就是两个回调：
 
 ```c
 struct dma_router {

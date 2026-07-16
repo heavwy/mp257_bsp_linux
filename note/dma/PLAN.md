@@ -526,8 +526,8 @@ spi_device 驱动 (consumer)
   │     ├── 完成 period N-1 → CLLR 指向 LLI[0] → 循环
   │     └── 一直循环到 trigger(STOP)
   │
-  ├── period 中断 (HTF):
-  │     ├── 每完成一个 period → CSR.HTF = 1
+  ├── period 中断 (LLI 完成中断):
+  │     ├── 每完成一个 period → 对应 LLI 的 CIE 中断
   │     ├── 中断 → stm32_dma3_irq_handler()
   │     │     └── vchan_cyclic_callback()
   │     │           └── tasklet_schedule()
@@ -582,7 +582,7 @@ UART 串口收发大量数据
 | **4.3 音频 cyclic DMA** | | |
 | 4.3.1 Audio 驱动 DMA 通道分配 | ASoC → snd_dmaengine_pcm_open → dma_request_chan | ALSA core |
 | 4.3.2 cyclic 配置与 LLI 循环链表 | dmaengine_prep_dma_cyclic 参数实际值 | stm32-dma3.c |
-| 4.3.3 period 中断处理 | HTF → vchan_cyclic_callback → ALSA period_elapsed | stm32-dma3.c + ALSA |
+| 4.3.3 period 中断处理 | LLI 完成中断 → vchan_cyclic_callback → ALSA period_elapsed | stm32-dma3.c + ALSA |
 | **4.4 UART 双通道 DMA** | | |
 | 4.4.1 RX/TX 通道分离 | dma_request_slave_channel × 2 | stm32-usart.c |
 | 4.4.2 RX 单段 SG 循环 | prep_slave_sg(1 SG) → complete → resubmit | stm32-usart.c |
