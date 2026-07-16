@@ -772,13 +772,15 @@ dma_unmap_single(dev, addr, size, DMA_FROM_DEVICE)
 
 两个映射类型的核心区别归结为一句话：**一致性映射牺牲延迟换取免维护，流式映射用 cache 命中率换性能但需要手动同步。**
 
+这就回答了 §1 末尾提出的第一个问题——**buffer 映射**有了统一的解决方案。但第二个问题——**传输编排**（怎么用 DMA 控制器实际做搬运）——还没有框架来管理。§1.7 中看到的"每个 DMA 驱动都在重复造轮子"的情况仍然存在。dmaengine 框架就是为了解决这个问题而诞生的。
+
 ---
 
-## 3. dmaengine：DMA 控制器框架诞生（v2.6.18, 2006）
+## 3. dmaengine：DMA 控制器框架（v2.6.18 → v2.6.29）
 
 ### 3.1 为什么需要 dmaengine
 
-2006 年之前，Linux 内核**有能力驱动 DMA 控制器硬件，但没有框架来管理它们**。Intel 的 I/O Acceleration Technology（I/OAT）是推动 dmaengine 诞生的直接动力。I/OAT 是一组集成了 DMA 引擎的芯片组功能，可以卸载 TCP 数据拷贝、RAID 校验计算等操作。Intel 需要内核提供一个标准框架来暴露这些硬件能力。
+2006 年之前，通用 DMA API 解决了 buffer 映射问题，但**传输编排仍然需要驱动自己实现**——每个 DMA 控制器驱动各自管理通道分配、描述符构建、中断处理。Intel 的 I/O Acceleration Technology（I/OAT）是推动 dmaengine 诞生的直接动力。I/OAT 是一组集成了 DMA 引擎的芯片组功能，可以卸载 TCP 数据拷贝、RAID 校验计算等操作。Intel 需要内核提供一个标准框架来暴露这些硬件能力。
 
 2006 年 3 月，Chris Leech 提交了第一版 dmaengine 补丁：
 
@@ -832,7 +834,7 @@ struct dma_async_tx_descriptor {
 
 设计意图很明确：dmaengine 定位为**异步内存拷贝的硬件卸载框架**——"DMA engines offload copy operations from the CPU to dedicated hardware, allowing the copies to happen asynchronously."（`drivers/dma/Kconfig`）。初始版本只支持 `DMA_MEMCPY` 一种操作类型。
 
-### 3.2 dma_client 模型（已被淘汰）
+### 3.2 初版设计：共享通道的 dma_client 模型
 
 早期的 dmaengine 使用 **dma_client** 模型分配通道：
 
@@ -851,25 +853,23 @@ struct dma_client {
 2. client 收到事件通知，拿到可用的 channel
 3. 使用完归还
 
-这个模型的核心假设是"DMA 通道可以被多个用户共享"——因为原始设计面向的是内存到内存的卸载（memcpy、XOR），这类操作不需要独占通道。
+这个模型的**核心假设**是"DMA 通道可以被多个用户共享"——因为原始设计面向的是内存到内存的卸载（memcpy、XOR），这类操作的特点是：通道换谁用都一样，不需要绑定特定外设硬件。
 
-**这个假设在外设 DMA 场景下不成立。**
+### 3.3 矛盾：外设 DMA 需要独占通道
 
----
+到 2008 年，越来越多的外设驱动试图使用 dmaengine：MMC 控制器（Atmel MCI）、串口、音频设备等。这些外设的共同特征是——**一旦 DMA 通道配置为外设 A 服务，就不能同时给外设 B 用**。DMA 控制器的通道与外设之间的连接是物理上固定的（通过 DMAMUX 或直接连线），不是运行时可以动态切换的。
 
-## 4. dmaengine redux：从 memcpy 卸载到外设 DMA（v2.6.29, 2009）
-
-### 4.1 共享通道模型的根本矛盾
-
-到 2008 年，越来越多的外设驱动试图使用 dmaengine：MMC 控制器（Atmel MCI）、串口（dmaengine 的 UART 用户）、音频设备等。这些外设的共同特征是——**一旦 DMA 通道配置为外设 A 服务，就不能同时给外设 B 用**。DMA 控制器的通道与外设之间的连接是物理上固定的（通过 DMAMUX 或直接连线），不是运行时动态分配的。
+dma_client 的事件回调模型在这里完全不适用。外设驱动不能"等通知再拿通道"——它必须在 probe 时就分配并绑定一个专用通道，之后独占使用。
 
 Dan Williams 在 2008 年 11 月提交了"dmaengine redux"补丁集，明确指出：
 
 > The primary difference between the two classes is that memory-to-memory offload is very amenable to channel sharing and is tolerant of dynamic channel changes. Compare this to the device-to-memory case where a channel must be dedicated to a device.
 
-这次重构是 dmaengine 历史上**最大的一次 API 变更**，24 个文件修改，679 行新增、1108 行删除。核心变化：
+这次重构是 dmaengine 历史上**最大的一次 API 变更**，24 个文件修改，679 行新增、1108 行删除。
 
-**变化一：引入 `dma_request_channel()` 替代 dma_client 模型**
+### 3.4 Redux：slave DMA 支持
+
+**变化一：`dma_request_channel()` 替代 dma_client**
 
 ```c
 /* 新 API：显式请求一个专用通道 */
@@ -883,18 +883,16 @@ struct dma_chan *dma_request_channel(dma_cap_mask_t mask,
 **变化二：区分 public 和 private 通道**
 
 ```c
-/* dma_device 新增 cap_mask 标记 */
-#define DMA_PRIVATE  /* 通道只用于外设 DMA，不能被 async_tx 共享 */
-#define DMA_ASYNC_TX /* 通道可用于内存到内存的卸载 */
-
-/* 外设驱动请求通道时标记 DMA_PRIVATE，
- * 确保这个通道不会被 async_tx 框架偷走 */
+#define DMA_PRIVATE   /* 通道只用于外设 DMA，不能被 async_tx 共享 */
+#define DMA_ASYNC_TX  /* 通道可用于内存到内存的卸载 */
 ```
 
-**变化三：引入 `device_prep_slave_sg()` 和 `dma_slave_config()`**
+外设驱动请求通道时标记 `DMA_PRIVATE`，确保这个通道不会被 async_tx 框架偷走。
+
+**变化三：新增 `device_prep_slave_sg()` 和 `dma_slave_config()`**
 
 ```c
-/* 核心新增 API 之一：配置外设传输参数 */
+/* 配置外设传输参数 */
 struct dma_slave_config {
     phys_addr_t src_addr;      /* 外设源地址（如 SPI RX FIFO 地址） */
     phys_addr_t dst_addr;      /* 外设目标地址（如 SPI TX FIFO 地址） */
@@ -905,16 +903,14 @@ struct dma_slave_config {
     enum dma_transfer_direction direction;
 };
 
-/* 核心新增 API 之二：准备 SG 传输 */
+/* 准备 SG 传输 */
 struct dma_async_tx_descriptor *device_prep_slave_sg(
     struct dma_chan *chan, struct scatterlist *sgl,
     unsigned int sg_len, enum dma_transfer_direction direction,
     unsigned long flags, void *context);
 ```
 
-### 4.2 传输方向模型
-
-新增的 `enum dma_transfer_direction` 明确了 DMA 数据传输的方向语义：
+新增的 `enum dma_transfer_direction` 明确了方向语义：
 
 | 方向 | 值 | 场景 |
 |------|-----|------|
@@ -922,6 +918,8 @@ struct dma_async_tx_descriptor *device_prep_slave_sg(
 | `DMA_MEM_TO_DEV` | 1 | 内存 → 外设（如 SPI TX、音频播放） |
 | `DMA_DEV_TO_MEM` | 2 | 外设 → 内存（如 SPI RX、音频录制） |
 | `DMA_DEV_TO_DEV` | 3 | 外设 → 外设（较少用） |
+
+### 3.5 dmaengine 的双重身份
 
 这次重构彻底定义了 dmaengine 的双重身份：
 
@@ -938,11 +936,13 @@ dmaengine
         └── DMA_INTERLEAVE（交错传输）
 ```
 
----
+外层（memcpy 卸载）和后加入的 slave 模式共存于同一个框架中。这种双重身份带来的复杂性，随后由 virt-dma 框架来解决——它针对 slave 模式提供了专门的辅助层。
 
-## 5. virt-dma：消除样板代码（v3.7, 2012）
+dmaengine 框架定义了通道、描述符、回调的标准模型，但每个 slave DMA 驱动仍然需要自己实现描述符队列管理、callback 调度、中断同步——这些代码在各个驱动之间高度重复。virt-dma 就是用来消除这些样板代码的。
 
-### 5.1 每个 DMA 驱动都在重复造轮子
+## 4. virt-dma：消除样板代码（v3.7, 2012）
+
+### 4.1 每个 DMA 驱动都在重复造轮子
 
 到 2012 年，Linux 内核中已经有数十个 DMA 控制器驱动。几乎每个 slave DMA 驱动都包含以下重复的逻辑：
 
@@ -985,7 +985,7 @@ Russell King 在 2012 年 5 月提交了 virt-dma 补丁集，将 SA-1110 DMA �
 
 > Split the virtual slave channel DMA support from the sa11x0 driver so this code can be shared with other slave DMA engine drivers.
 
-### 5.2 virt-dma 的设计
+### 4.2 virt-dma 的设计
 
 virt-dma 的核心是两个结构体：
 
@@ -1054,7 +1054,7 @@ virt-dma 引入后，新编写的 slave DMA 驱动只需要关注三件事：
 
 其余描述符管理、回调调度、同步原语都由 virt-dma 提供。这正是 virt-dma 的价值——**消除样板代码**。
 
-### 5.3 同一系列：cyclic DMA
+### 4.3 同一系列：cyclic DMA
 
 virt-dma 补丁系列同时添加了 `device_prep_dma_cyclic` 支持。cyclic（循环）传输是音频设备的核心需求：
 
@@ -1087,11 +1087,13 @@ ALSA period_elapsed()
     → 应用程序填充下一个 period 的音频数据
 ```
 
+以上从 §2 到 §4，解决的都是**单一设备**的 DMA 问题——CPU 怎么配 buffer，DMA 控制器怎么搬，驱动怎么写才不重复。但在现代 SoC 上，DMA 的另一个关键场景是**多个设备共享同一块 buffer**：摄像头采集一帧数据，编码器处理，最后显示——每个设备都有自己的 DMA 引擎，如果每步都拷贝一遍，性能损失巨大。dma-buf 就是为这个场景设计的。
+
 ---
 
-## 6. dma-buf：跨设备 buffer 共享（v3.3, 2012）
+## 5. dma-buf：跨设备 buffer 共享（v3.3, 2012）
 
-### 6.1 问题：一次 DMA，多个消费者
+### 5.1 问题：一次 DMA，多个消费者
 
 在多媒体 SoC 上，一个典型的场景是：摄像头采集一帧数据 → 交给视频编码器 → 编码后的数据给显示控制器渲染。每个模块都有自己的 DMA 引擎，数据在各个引擎之间移动。
 
@@ -1107,7 +1109,7 @@ Camera DMA → 共享 buffer → 编码器 DMA
 
 2011 年之前，没有标准机制来实现这种共享。V4L2 有自己的 buffer 管理（`VIDIOC_REQBUFS`），DRM 有 GEM/TTM，fbdev 使用自己的 framebuffer。这些子系统之间互相不知道对方的存在——即使它们的底层内存来自同一个 CMA 池。
 
-### 6.2 dma-buf 设计
+### 5.2 dma-buf 设计
 
 2011 年 Linaro 内存管理峰会上，多家厂商（TI、三星、Intel）一致认为需要一个统一的内核级 buffer 共享机制。Sumit Semwal 在 2011 年 10 月提交了第一版 RFC，经过 4 轮 review（涉及 Dave Airlie、Daniel Vetter、Rob Clark、Arnd Bergmann 等多位维护者），最终在 v3.3 合入主线。
 
@@ -1175,7 +1177,7 @@ dma-buf 的核心设计决策是**基于 fd 的共享模型**。选择 fd 而非
 2. **fd 可以 mmap**——用户态通过 `mmap(dmabuf_fd)` 直接访问 DMA buffer，实现了"用户分配、内核搬运、用户消费"的闭环
 3. **fd 在多进程间天然可传递**——通过 UNIX domain socket 的 `SCM_RIGHTS`，一个进程的 dmabuf fd 可以传给另一个不相关的进程
 
-### 6.3 dma-heap：用户态分配 DMA buffer（v5.6, 2020）
+### 5.3 dma-heap：用户态分配 DMA buffer（v5.6, 2020）
 
 dma-buf 解决了跨设备共享的问题，但**谁分配物理内存**的问题没有统一答案。最初的导出者（V4L2、DRM）各自通过自己的机制分配内存。对于用户态应用（如 GStreamer 管道：摄像头→编码→显示），如果没有一个统一的用户态 DMA buffer 分配接口，应用开发者需要在 V4L2 和 DRM 之间传递 fd，依赖关系变得复杂。
 
@@ -1244,11 +1246,13 @@ STM32MP257 上可用的 dma-heap 类型：
 | `/dev/dma_heap/system` | `system_heap.c` | 不保证连续 | 不需要物理连续的外设（配有 IOMMU/SMMU） |
 | `/dev/dma_heap/cma` | `cma_heap.c` | 物理连续（来自 CMA 池） | 需要物理连续的外设（STM32MP257 HPDMA 直接连接 AXI 总线） |
 
+以上解决了多设备共享同一块 buffer 的问题。但 DMA 子系统的另一条演进线来自 SoC 硬件本身的复杂度增长——外设数量越来越多，DMA 控制器的固定通道数不够用。DMAMUX 和 DMA Router 框架就是为此设计的。
+
 ---
 
-## 7. DMA Router 框架（v3.19, 2015）
+## 6. DMA Router 框架（v3.19, 2015）
 
-### 7.1 DMAMUX 是什么
+### 6.1 DMAMUX 是什么
 
 随着 SoC 上外设数量增多，一个矛盾出现了：DMA 控制器通道数量有限（STM32MP257 的 HPDMA 每个实例只有 16 个通道），而需要 DMA 的外设可能有几十个（UART×8、SPI×6、I2C×6、SDMMC×2、SAI×4...）。不是所有外设同时需要 DMA，所以 SoC 设计者在 DMA 控制器和外设之间增加了一层**请求路由器**——DMAMUX。
 
@@ -1267,7 +1271,7 @@ SAI1_B    ─┤   │  路由)    │    │  ...          │
 
 DMAMUX 的本质是一个多路选择器：每个 HPDMA 通道对应一个 DMAMUX 通道，每个 DMAMUX 通道可以通过写寄存器选择从哪个外设接收 DMA 请求。
 
-### 7.2 dma_router 框架
+### 6.2 dma_router 框架
 
 在引入 DMA Router 框架之前，每个需要 DMAMUX 的 SoC 都要在 DMA 控制器驱动内部实现路由逻辑。TI 的 crossbar、STM32 的 DMAMUX、i.MX 的 DMA mux 都是类似硬件，但它们的驱动是各自实现的。
 
@@ -1338,11 +1342,13 @@ dma_router 框架将 DTS 配置与路由逻辑解耦。DTS 中不再需要直接
 - cell 1：通道配置字（优先级、FIFO 阈值、数据宽度等）
 - cell 2：LLI 配置字（linked-list 传输参数）
 
+dmaengine 框架的核心功能（通道管理、描述符编排、传输控制）到 DMA Router 阶段已经基本定型。后续的演进集中在精细化和能力扩展上——从"能不能搬"到"搬得怎么样、能不能捎带更多信息"。
+
 ---
 
-## 8. 现代演进：粒度、能力与 metadata
+## 7. 现代演进：粒度、能力与 metadata
 
-### 8.1 Granularity：传输进度报告
+### 7.1 Granularity：传输进度报告
 
 早期的 dmaengine 只有 `DMA_COMPLETE`/`DMA_IN_PROGRESS`/`DMA_ERROR` 三种状态。对于需要知道"传输还剩多少字节"的外设驱动（如音频需要知道当前播放位置），这不够用。
 
@@ -1356,7 +1362,7 @@ enum dma_residue_granularity {
 };
 ```
 
-### 8.2 Per-channel capabilities
+### 7.2 Per-channel capabilities
 
 随着 DMA 控制器越来越复杂（不同通道有不同的地址宽度支持、不同的传输方向限制），全局的 `dma_device` 能力字段不够用了。`device_caps` 回调让驱动可以报告每个通道的独立能力：
 
@@ -1375,7 +1381,7 @@ struct dma_slave_caps {
 };
 ```
 
-### 8.3 Metadata 支持
+### 7.3 Metadata 支持
 
 新一代 DMA 控制器（如 STM32 DMA3、TI K3 UDMA）支持传输 metadata——与数据 payload 并行传输的控制信息，例如加密参数、校验和上下文、外设配置字。`dma_descriptor_metadata_ops` 提供了标准化接口：
 
@@ -1390,27 +1396,23 @@ struct dma_descriptor_metadata_ops {
 };
 ```
 
-### 8.4 STM32 DMA3：现代 DMA 控制器的代表
+### 7.4 STM32 DMA3：现代 DMA 控制器的代表
 
-STM32MP257 的 HPDMA（stm32-dma3）体现了现代 DMA 控制器的典型特征：
+STM32MP257 的 HPDMA（stm32-dma3）集中体现了本章讨论的现代演进特征。§1.4 中已经对比了它与早期 DMAC 的硬件参数差异，这里重点看在 dmaengine 框架层面的能力：
 
-| 特性 | 说明 |
-|------|------|
-| **LLI 链式传输** | 硬件预取下一段描述符，无需 CPU 干预 |
-| **多通道并行** | 每个实例 16 通道，3 实例共 48 通道 |
-| **DMAMUX 路由** | 外设请求号灵活映射，支持 >250 个请求源 |
-| **AXI 主接口** | 直接连接系统总线，高带宽 |
-| **16 条独立中断线/实例** | 每个通道独立中断，或共享中断线 |
-| **暂停/恢复** | 不需要 terminate 后重建描述符 |
-| **Scatter-gather 硬件支持** | LLI 链表由硬件自动遍历 |
-| **可编程 burst 大小** | 根据外设 FIFO 深度优化 |
-| **FIFO 阈值配置** | 控制何时触发请求传输 |
+| 框架能力 | 旧 DMA 控制器（如 dw_dmac） | STM32 DMA3 |
+|---------|---------------------------|------------|
+| **粒度报告** | 只返回完成/未完成 | `DMA_RESIDUE_GRANULARITY_BURST` |
+| **Per-channel caps** | 全局能力相同 | 每个通道独立报告 `dma_slave_caps` |
+| **Metadata** | 不支持 | 支持 `dma_descriptor_metadata_ops` |
+| **暂停/恢复** | 无 | 硬件支持 cmd_pause/cmd_resume |
+| **描述符预取** | CPU 逐个喂描述符 | 硬件自动遍历 LLI 链表 |
 
-与早期的 DMA 控制器（如 Intel I/OAT、dw_dmac）相比，STM32 DMA3 代表了从"简单 memcpy 加速器"到"智能数据搬运引擎"的演进方向。
+STM32 DMA3 体现了从"简单的 memcpy 加速器"到"智能数据搬运引擎"的演进方向——框架已经标准化，硬件能力持续增加，驱动只需填充描述符即可。这就是 dmaengine 框架近二十年演进的结果。
 
 ---
 
-## 9. 时间线总览
+## 8. 时间线总览
 
 ```
 年份    内核版本      事件
@@ -1436,7 +1438,7 @@ STM32MP257 的 HPDMA（stm32-dma3）体现了现代 DMA 控制器的典型特征
 
 ---
 
-## 10. 写作要点回顾
+## 9. 写作要点回顾
 
 本文追溯了 Linux DMA 子系统的四个演进主线：
 
