@@ -74,7 +74,7 @@ DMAMUX、HPDMA、dma-mapping、外设 DMA 是同一个完整链路的不同层�
 |------|--------|---------|
 | **用户态**：dma-heap/dma-buf | 用户分配 DMA buffer + fd 传递 + mmap | 01-Usage、02-Architecture、04-Scenario |
 | **内核态**：dma-mapping API | buffer 准备：申请/映射/同步 | 01-Usage、02-Architecture |
-| **内核态**：dmaengine 框架 | 传输编排：描述符/提交/启动 | 01-Usage、02-Architecture |
+| **内核态**：dmaengine 框架 | 传输控制：描述符/提交/启动 | 01-Usage、02-Architecture |
 | **硬件**：HPDMA + DMAMUX + MDMA | 硬件实现注册到 dmaengine | 02-Architecture、03-SourceAnalysis |
 | **实践**：外设 DMA 用法 | SPI/音频/UART 如何调用 dmaengine | 01-Usage、04-Scenario |
 
@@ -217,7 +217,7 @@ MDMA 则是独立的 MCE 引擎，专注于大块 memory-to-memory 搬运，与 
 | 1.4.4 什么时候用哪个 | 对比表格 + 代码选择逻辑 | 频率、大小、延迟要求 |
 | 1.4.5 DMA 掩码 | `dma_set_mask_and_coherent()` | 告知硬件能访问的地址范围 |
 | 1.4.6 实际例子：SPI DMA | coherent vs streaming 在 SPI 中的实际选择 | 驱动源码中的真实用法 |
-| **1.5 dmaengine API（传输编排）** | | |
+| **1.5 dmaengine API（传输控制）** | | |
 | 1.4.1 通道生命周期 | `dma_request_chan` → config → prep → submit → issue | 状态机：requested → configured → submitted → issued → active → completed |
 | 1.4.2 slave_sg 传输 | `dmaengine_prep_slave_sg()` 完整参数 | scatterlist 的构造、方向和 flag |
 | 1.4.3 cyclic 传输 | `dmaengine_prep_dma_cyclic()` 参数 | period_len 与 buf_len 的关系、音频应用 |

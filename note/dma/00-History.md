@@ -639,7 +639,7 @@ void pci_dma_sync_single(struct pci_dev *pdev, dma_addr_t dma_handle,
 | 问题 | 描述 | 解决方案 |
 |------|------|---------|
 | **buffer 映射** | 驱动需要把 CPU 看的虚拟地址转成 DMA 设备能访问的总线地址，还要处理 cache 一致性 | 通用 DMA API（dma-mapping） |
-| **传输编排** | 驱动需要分配通道、建立描述符、提交传输、处理完成中断——每个 DMA 控制器的管理方式不同 | dmaengine 框架 |
+| **传输控制** | 驱动需要分配通道、建立描述符、提交传输、处理完成中断——每个 DMA 控制器的管理方式不同 | dmaengine 框架 |
 
 这两个问题的解决方案是在不同时间线分别演进的，我们按时间顺序展开。
 
@@ -715,7 +715,7 @@ struct dma_map_ops {
 };
 ```
 
-通用 DMA API 的引入是 DMA 子系统演进的**第一次统一**。但它只解决了"buffer 映射"问题——驱动开发者现在可以轻松地将一个内存 buffer 映射为 DMA 可访问的地址。**传输编排（怎么用 DMA 控制器实际做搬运）仍然需要驱动自己实现。**
+通用 DMA API 的引入是 DMA 子系统演进的**第一次统一**。但它只解决了"buffer 映射"问题——驱动开发者现在可以轻松地将一个内存 buffer 映射为 DMA 可访问的地址。**传输控制（怎么用 DMA 控制器实际做搬运）仍然需要驱动自己实现。**
 
 ### 2.2 两个核心选择：coherent vs streaming
 
@@ -731,9 +731,9 @@ cpu_ptr = dma_alloc_coherent(dev, size, &dma_handle, GFP_KERNEL);
 ```
 
 一致性映射适合以下场景：
-- DMA 描述符环（descriptor ring）—— CPU 和 DMA 控制器频繁同时读写
-- 音频 DMA buffer——CPU 写入音频数据、DMA 读取发往 I2S
-- 网络 DMA —— DMA 写入接收数据、CPU 读取
+- DMA 描述符环 —— CPU 和 DMA 控制器频繁同时读写描述符。一次传输可能几十次交互，每笔都 sync 开销远大于 non-cacheable 的访存损失
+- 音频 DMA buffer —— CPU 持续写入 PCM 数据、DMA 持续读取发往 I2S，几毫秒一个 period。streaming 模式下每 period 刷一次 cache 的 CPU 时间不可接受
+- 视频帧 buffer —— 摄像头 DMA 写入、GPU/CPU 读取，同一块 buffer 被多个 master 反复访问。用 streaming 需要在每次 master 切换时 sync，复杂度高且容易遗漏
 
 硬件上，`dma_alloc_coherent()` 在 ARM64 上通过页表属性将页面标记为 Normal Non-Cacheable（使用 MAIR_EL1 中的属性索引），这样 CPU 访问该页面时不经过 cache，直接读写内存。代价是访问延迟增加（cache 缺失的延迟）。
 
@@ -749,9 +749,9 @@ dma_unmap_single(dev, dma_handle, size, DMA_TO_DEVICE);
 ```
 
 流式映射适合以下场景：
-- 网络收发 buffer——从 `alloc_skb()` 得到的 buffer，映射后交给 DMA 传输
-- 块设备 I/O buffer——从页缓存来的数据
-- 单次 SPI 传输 buffer——传输完成后不再需要
+- 网络收发 buffer —— 从 `alloc_skb()` 得到的 buffer，一次收/发就完事，随后 skb 被释放或回收。用 coherent 反而让持续的内存访问损失 cache 命中率
+- 块设备 I/O buffer —— 页缓存的页面在 DMA 传输前后被大量 CPU 读写，不能做成 non-cacheable。只在传输那一刻需要 sync，其余时间享受 cache 性能
+- 单次 SPI 传输 buffer —— 一锤子买卖，streaming 最合适。为此专门分配一段 coherent 内存太浪费
 
 流式映射的 cache 维护路径（ARM64 为例）：
 ```
@@ -772,7 +772,7 @@ dma_unmap_single(dev, addr, size, DMA_FROM_DEVICE)
 
 两个映射类型的核心区别归结为一句话：**一致性映射牺牲延迟换取免维护，流式映射用 cache 命中率换性能但需要手动同步。**
 
-这就回答了 §1 末尾提出的第一个问题——**buffer 映射**有了统一的解决方案。但第二个问题——**传输编排**（怎么用 DMA 控制器实际做搬运）——还没有框架来管理。§1.7 中看到的"每个 DMA 驱动都在重复造轮子"的情况仍然存在。dmaengine 框架就是为了解决这个问题而诞生的。
+这就回答了 §1 末尾提出的第一个问题——**buffer 映射**有了统一的解决方案。但第二个问题——**传输控制**（怎么用 DMA 控制器实际做搬运）——还没有框架来管理。§1.7 中看到的"每个 DMA 驱动都在重复造轮子"的情况仍然存在。dmaengine 框架就是为了解决这个问题而诞生的。
 
 ---
 
@@ -780,7 +780,7 @@ dma_unmap_single(dev, addr, size, DMA_FROM_DEVICE)
 
 ### 3.1 为什么需要 dmaengine
 
-2006 年之前，通用 DMA API 解决了 buffer 映射问题，但**传输编排仍然需要驱动自己实现**——每个 DMA 控制器驱动各自管理通道分配、描述符构建、中断处理。Intel 的 I/O Acceleration Technology（I/OAT）是推动 dmaengine 诞生的直接动力。I/OAT 是一组集成了 DMA 引擎的芯片组功能，可以卸载 TCP 数据拷贝、RAID 校验计算等操作。Intel 需要内核提供一个标准框架来暴露这些硬件能力。
+2006 年之前，通用 DMA API 解决了 buffer 映射问题，但**传输控制仍然需要驱动自己实现**——每个 DMA 控制器驱动各自管理通道分配、描述符构建、中断处理。Intel 的 I/O Acceleration Technology（I/OAT）是推动 dmaengine 诞生的直接动力。I/OAT 是集成在 Intel 芯片组（内存控制器）中的一组硬件加速单元。它内含的 DMA 引擎不仅能做标准的数据搬运（memcpy），还能在搬运的同时做 XOR 校验计算——这对 RAID5/6 的校验生成非常有用。I/OAT 把 CPU 从数据搬运和校验计算中解放出来，让 CPU 去处理协议逻辑。Intel 需要内核提供一个标准框架来使用这些硬件能力，这就是 dmaengine 的起点。
 
 2006 年 3 月，Chris Leech 提交了第一版 dmaengine 补丁：
 
@@ -832,11 +832,36 @@ struct dma_async_tx_descriptor {
 };
 ```
 
-设计意图很明确：dmaengine 定位为**异步内存拷贝的硬件卸载框架**——"DMA engines offload copy operations from the CPU to dedicated hardware, allowing the copies to happen asynchronously."（`drivers/dma/Kconfig`）。初始版本只支持 `DMA_MEMCPY` 一种操作类型。
+设计意图很明确：dmaengine 定位为**异步内存拷贝的硬件加速框架**——把数据拷贝工作从 CPU 交给专用 DMA 硬件去做，拷贝在后台异步完成。内核 Kconfig 原文："DMA engines offload copy operations from the CPU to dedicated hardware, allowing the copies to happen asynchronously."
+
+一个典型的用法——用 dmaengine 做一次异步 memcpy：
+
+```c
+/* 1. 注册 dma_client 到框架，拿到一个可用通道（通过事件回调） */
+struct dma_client client;
+client.event_callback = my_channel_event;    /* 回调中拿到 chan */
+dma_async_client_register(&client);
+
+/* 2. 拿到通道后，准备 memcpy 传输描述符 */
+struct dma_async_tx_descriptor *tx;
+tx = chan->device->device_prep_dma_memcpy(chan, dst_dma, src_dma, len, 0);
+
+/* 3. 注册完成回调 */
+tx->callback = my_callback;
+tx->callback_param = my_data;
+
+/* 4. 提交并启动 */
+tx->tx_submit(tx);              /* 入队 */
+chan->device->device_issue_pending(chan);  /* 启动硬件传输 */
+
+/* 5. 传输在后台异步进行... 完成后回调 my_callback */
+```
+
+初始版本只支持 `DMA_MEMCPY` 一种操作类型，它的设计假设是：谁需要 memcpy 加速就注册进来、拿到通道、用完归还，通道可以在不同用户之间动态切换。
 
 ### 3.2 初版设计：共享通道的 dma_client 模型
 
-早期的 dmaengine 使用 **dma_client** 模型分配通道：
+基于 memcpy-only 这个假设，dmaengine 的第一版设计了 **dma_client** 模型来管理通道分配：
 
 ```c
 struct dma_client {
@@ -853,68 +878,138 @@ struct dma_client {
 2. client 收到事件通知，拿到可用的 channel
 3. 使用完归还
 
-这个模型的**核心假设**是"DMA 通道可以被多个用户共享"——因为原始设计面向的是内存到内存的卸载（memcpy、XOR），这类操作的特点是：通道换谁用都一样，不需要绑定特定外设硬件。
+这个模型的**核心假设**是"DMA 通道可以被多个用户共享"——因为原始设计面向的是 memcpy 类的内存拷贝加速（memcpy、XOR），这类操作的特点是：通道换谁用都一样，不需要绑定特定外设硬件。
 
 ### 3.3 矛盾：外设 DMA 需要独占通道
 
-到 2008 年，越来越多的外设驱动试图使用 dmaengine：MMC 控制器（Atmel MCI）、串口、音频设备等。这些外设的共同特征是——**一旦 DMA 通道配置为外设 A 服务，就不能同时给外设 B 用**。DMA 控制器的通道与外设之间的连接是物理上固定的（通过 DMAMUX 或直接连线），不是运行时可以动态切换的。
+dma_client 在 memcpy 加速场景下工作得很好——任何空闲通道都能做 memcpy，用完就归还。但到 2008 年，越来越多的外设驱动试图使用 dmaengine，问题立刻暴露了。
 
-dma_client 的事件回调模型在这里完全不适用。外设驱动不能"等通知再拿通道"——它必须在 probe 时就分配并绑定一个专用通道，之后独占使用。
+拿一个具体的例子来看。假设 SoC 上有一个 SPI 控制器和一个 UART 控制器，它们都需要 DMA：
 
-Dan Williams 在 2008 年 11 月提交了"dmaengine redux"补丁集，明确指出：
+```
+硬件拓扑：
+                    DMAMUX 路由表                  HPDMA
+SPI2_RX ── 请求号 0x62 ──→ DMAMUX 通道 3 ──→ HPDMA 通道 5
+UART4_TX ─ 请求号 0x42 ──→ DMAMUX 通道 4 ──→ HPDMA 通道 6
+```
+
+SPI2 的 RX 请求线在 SoC 内部硬连线到 DMAMUX 的输入端口 0x62。即使 HPDMA 有 16 个空闲通道，能服务 SPI2 的**只有配置了 DMAMUX 路由到 0x62 的那个通道**。HPDMA 通道 5 配好了就是给 SPI2 的，换不了。
+
+外设驱动在 probe 时需要：
+1. 分配一个 HPDMA 通道
+2. 配置 DMAMUX 把请求号 0x62 路由到这个通道
+3. 配置 HPDMA 通道的参数（burst 大小、数据宽度、FIFO 阈值——这些由 SPI 的硬件特性决定）
+4. 之后这个通道**永远只服务 SPI2**，不能被其他设备抢走
+
+memcpy 加速 vs 外设 DMA 的对比：
+
+| | memcpy 加速（dma_client 假设的场景） | 外设 DMA（实际需求） |
+|--|-------------------------------------|-------------------|
+| 通道需求 | 任何空闲通道都可以 | 必须绑定特定外设请求线 |
+| 通道配置 | 无（只需 src/dst/len） | burst 大小、数据宽度、FIFO 阈值由外设固定 |
+| 分配时机 | 运行时临时用临时申请 | probe 时分配，独占整个生命周期 |
+| 归还后 | 其他 memcpy 任务可立即复用 | 必须重新配置 DMAMUX 和通道参数 |
+
+dma_client 的事件回调模型在这里完全不适用——外设驱动不能注册一个 client 然后等框架通知它"有空闲通道了"。它必须在 probe 时就主动请求一个绑定到特定请求线的专用通道。
+
+这就是 Dan Williams 在 2008 年 11 月提交"dmaengine redux"补丁集的直接原因。他在补丁描述中明确指出：
 
 > The primary difference between the two classes is that memory-to-memory offload is very amenable to channel sharing and is tolerant of dynamic channel changes. Compare this to the device-to-memory case where a channel must be dedicated to a device.
 
-这次重构是 dmaengine 历史上**最大的一次 API 变更**，24 个文件修改，679 行新增、1108 行删除。
+这次重构是 dmaengine 历史上**最大的一次 API 变更**，24 个文件修改，679 行新增、1108 行删除。三个核心变化如下。
 
 ### 3.4 Redux：slave DMA 支持
 
+Redux 是 Dan Williams 补丁标题的原词，意为一轮大改后的新版本。这次重构主线是：dmaengine 从专用 memcpy 加速器扩展到服务外设 DMA。
+
+"Slave DMA" 是 dmaengine 框架里的术语：外设作为 DMA 控制器的"slave"（被服务方），DMA 控制器把外设 FIFO 的数据搬到内存，或把内存数据写到外设 FIFO。和外设无关的 memcpy 则称为"memory-to-memory"。两个模式共存于同一套框架中。
+
 **变化一：`dma_request_channel()` 替代 dma_client**
 
-```c
-/* 新 API：显式请求一个专用通道 */
-struct dma_chan *dma_request_channel(dma_cap_mask_t mask,
-                                     dma_filter_fn filter_fn,
-                                     void *filter_param);
+新旧 API 的对比最直观：
 
-/* 不再通过事件回调被动接收通道，而是主动请求 */
+```c
+/* 旧 API（dma_client）：拿到的通道不确定 */
+struct dma_client client;
+client.event_callback = my_callback;
+dma_async_client_register(&client);
+/* 框架通知你一个空闲通道，但不知道是哪个通道、绑定到哪个请求线 */
+/* 对于 memcpy 可以（任何通道都能做），对于外设 DMA 不行 */
+
+/* 新 API（dma_request_channel）：指定我要哪个通道 */
+struct dma_chan *chan;
+chan = dma_request_channel(mask, stm32_dma_filter, &req_id);
+/* filter_fn：由 DMA 控制器驱动提供的筛选函数，从可用通道中挑出硬件匹配的那个 */
+/* filter_param：外设请求号，stm32_dma_filter 遍历 HPDMA 通道，返回绑定此请求号的通道 */
+/* 不同 DMA 控制器的 filter 不同（如 pl08x_filter_id），但接口统一 */
+/* 调用返回即拿到通道，同步、确定；拿不到返回 NULL */
 ```
 
+**核心区别**：旧 API 拿到的是"某个可用通道"（对 memcpy 够用），新 API 拿到的是"绑定到指定外设请求线的特定通道"（对外设 DMA 刚需）。
+
 **变化二：区分 public 和 private 通道**
+
+两个标记决定了通道能被谁使用：
 
 ```c
 #define DMA_PRIVATE   /* 通道只用于外设 DMA，不能被 async_tx 共享 */
 #define DMA_ASYNC_TX  /* 通道可用于内存到内存的卸载 */
 ```
 
-外设驱动请求通道时标记 `DMA_PRIVATE`，确保这个通道不会被 async_tx 框架偷走。
+为什么需要这个区分？看一个场景：
+
+```
+SPI 驱动 probe 时申请了一个通道：
+  dma_request_channel(mask, stm32_dma_filter, &spi_rx_req)
+  → 拿到 HPDMA 通道 5，配好了 DMAMUX 和 burst 参数
+  → 这个通道标记为 DMA_PRIVATE
+
+之后系统有大量 memcpy 要加速：
+  async_tx 框架扫描空闲通道
+  → 通道 5 标记了 DMA_PRIVATE → async_tx 跳过
+  → SPI 驱动的通道配置完好无损
+```
+
+如果没有 `DMA_PRIVATE`，async_tx 框架看到通道 5 当前没人用，就把它拿去做了 memcpy——覆写了 burst 参数和 DMAMUX 路由配置。等 SPI 下次发起传输时，通道配置已经乱了。
+
+**决定了通道归谁用：**
+- 外设驱动申请的通道 → `DMA_PRIVATE` → 独占，async_tx 不能碰
+- memcpy/XOR 卸载用的通道 → `DMA_ASYNC_TX` → 共享，谁需要谁用
 
 **变化三：新增 `device_prep_slave_sg()` 和 `dma_slave_config()`**
 
-```c
-/* 配置外设传输参数 */
-struct dma_slave_config {
-    phys_addr_t src_addr;      /* 外设源地址（如 SPI RX FIFO 地址） */
-    phys_addr_t dst_addr;      /* 外设目标地址（如 SPI TX FIFO 地址） */
-    enum dma_slave_buswidth src_addr_width;
-    enum dma_slave_buswidth dst_addr_width;
-    u32 src_maxburst;
-    u32 dst_maxburst;
-    enum dma_transfer_direction direction;
-};
+前两个变化解决了"怎么拿到并保护一个专用通道"的问题。拿到通道后，外设驱动还需要**配置通道参数**（数据从哪个外设 FIFO 搬、一次搬几个字节、burst 多大）和**准备描述符**（把要搬的数据列成 SG 表）。这两个新 API 就是干这个的。
 
-/* 准备 SG 传输 */
-struct dma_async_tx_descriptor *device_prep_slave_sg(
-    struct dma_chan *chan, struct scatterlist *sgl,
-    unsigned int sg_len, enum dma_transfer_direction direction,
-    unsigned long flags, void *context);
+用一个具体的 SPI RX 传输来看完整流程：
+
+```c
+/* SPI 驱动申请到通道后，第一步：配置外设参数 */
+struct dma_slave_config config = {
+    .src_addr       = 0x44020000 + 0x0C,  /* SPI RX FIFO 的物理地址 */
+    .src_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES,  /* SPI 数据寄存器 32 位 */
+    .src_maxburst   = 4,                  /* 每次 burst 读 4 个字 */
+    .direction      = DMA_DEV_TO_MEM,     /* 方向：外设 → 内存 */
+};
+dmaengine_slave_config(chan, &config);     /* 将配置写入 HPDMA 通道寄存器 */
+
+/* 第二步：准备传输描述符——把 SPI FIFO 的数据搬到内存 buffer */
+struct scatterlist sg;
+sg_dma_address(&sg) = dma_handle;         /* 内存 buffer 的 DMA 地址 */
+sg_dma_len(&sg)      = 256;               /* 传输 256 字节 */
+
+struct dma_async_tx_descriptor *tx;
+tx = dmaengine_prep_slave_sg(chan, &sg, 1, DMA_DEV_TO_MEM, 0);
+/* chan     → 前面配好的 HPDMA 通道 5 */
+/* &sg      → SG 表：从 SPI FIFO 搬 256 字节到 dma_handle */
+/* 1        → 1 个 SG 段 */
+/* DMA_DEV_TO_MEM → 方向 */
 ```
 
-新增的 `enum dma_transfer_direction` 明确了方向语义：
+对比 memcpy 的 prep 调用，差异一目了然——slave 模式多了外设地址、总线宽度、burst 大小等硬件参数，这些在 memcpy 中不存在，因为 memcpy 不跟外设打交道。
 
 | 方向 | 值 | 场景 |
 |------|-----|------|
-| `DMA_MEM_TO_MEM` | 0 | memcpy 卸载 |
+| `DMA_MEM_TO_MEM` | 0 | memcpy 加速 |
 | `DMA_MEM_TO_DEV` | 1 | 内存 → 外设（如 SPI TX、音频播放） |
 | `DMA_DEV_TO_MEM` | 2 | 外设 → 内存（如 SPI RX、音频录制） |
 | `DMA_DEV_TO_DEV` | 3 | 外设 → 外设（较少用） |
@@ -936,9 +1031,7 @@ dmaengine
         └── DMA_INTERLEAVE（交错传输）
 ```
 
-外层（memcpy 卸载）和后加入的 slave 模式共存于同一个框架中。这种双重身份带来的复杂性，随后由 virt-dma 框架来解决——它针对 slave 模式提供了专门的辅助层。
-
-dmaengine 框架定义了通道、描述符、回调的标准模型，但每个 slave DMA 驱动仍然需要自己实现描述符队列管理、callback 调度、中断同步——这些代码在各个驱动之间高度重复。virt-dma 就是用来消除这些样板代码的。
+dmaengine 框架从此承载了两类完全不同的工作：memcpy 加速（简单，通道共享，即用即还）和 slave DMA（复杂，通道独占，需要描述符队列管理、中断处理、回调调度）。框架本身的 API 是统一的，但 slave 模式的驱动编写者仍然要自己实现描述符状态机、tasklet 调度、中断同步——这些代码跟框架无关，每个驱动都在重复。virt-dma 就是针对 slave 模式的这些共性问题提供了一个可复用的辅助层。
 
 ## 4. virt-dma：消除样板代码（v3.7, 2012）
 
